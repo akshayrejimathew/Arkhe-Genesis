@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { AlertTriangle, Shield, Activity, Loader2, Zap } from 'lucide-react';
-import { useArkheStore, useSentinelHazards, useIsAuditing } from '@/hooks/useArkheStore';
+import { useArkheStore, useSentinelHazards, useIsAuditing } from '@/store';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));
 

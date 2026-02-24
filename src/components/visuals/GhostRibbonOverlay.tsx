@@ -2,17 +2,28 @@
 
 import React, { useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { clsx } from 'clsx';
+import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore, type ArkheState } from '@/store';
+import type { SyntenyAnchor } from '@/types/arkhe';
 
-const cn = (...inputs: any[]) => twMerge(clsx(inputs));
+const cn = (...inputs: ClassValue[]) => twMerge(clsx(inputs));
 
 interface GhostRibbonOverlayProps {
   containerWidth: number;
   containerHeight: number;
   basesPerRow: number;
   rowHeight: number;
+}
+
+// Strictly typed ribbon for internal mapping
+interface SyntenyRibbon {
+  id: string;
+  path: string;
+  color: string;
+  anchor: SyntenyAnchor;
+  coordsA: { x: number; y: number };
+  coordsB: { x: number; y: number };
 }
 
 export default function GhostRibbonOverlay({
@@ -46,7 +57,7 @@ export default function GhostRibbonOverlay({
   };
 
   // Build ribbon paths for visible anchors
-  const ribbons = useMemo(() => {
+  const ribbons: SyntenyRibbon[] = useMemo(() => {
     if (!syntenyAnchors || syntenyAnchors.length === 0) return [];
 
     return syntenyAnchors
@@ -87,7 +98,7 @@ export default function GhostRibbonOverlay({
           coordsB,
         };
       })
-      .filter(Boolean);
+      .filter((ribbon): ribbon is SyntenyRibbon => ribbon !== null);
   }, [syntenyAnchors, viewportStart, viewportEnd, basesPerRow, rowHeight]);
 
   if (ribbons.length === 0) return null;
@@ -111,7 +122,7 @@ export default function GhostRibbonOverlay({
           </filter>
         </defs>
 
-        {ribbons.map((ribbon: any) => {
+        {ribbons.map((ribbon) => {
           const isHovered = hoveredAnchor === ribbon.id;
           
           return (

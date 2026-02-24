@@ -19,6 +19,17 @@
  *   Uint8Array.set() — a single native SIMD memcpy call per slab.
  *   For 1MB slabs and 100MB input: 100 iterations + 100 memcpy calls.
  *   Wall-clock: ~200ms (50–60× speedup).
+ *
+ * SPRINT 1 AUDIT FIX — SLAB-META-01 (2026-02-22):
+ *
+ *   Intermediate slab metadata was never updated in appendBytes().
+ *   Only the LAST slab touched received a metadata refresh; every slab
+ *   boundary crossed during a large append left stale `length = 0` values
+ *   in this.slabMeta for the intermediate slabs.
+ *
+ *   Fix: inside the while loop, immediately after slab.set(), update
+ *   this.slabMeta for the current slabIndex so every touched slab has
+ *   accurate metadata before the next iteration.
  */
 
 import type { BaseCode, SlabMeta } from '@/types/arkhe';
@@ -145,6 +156,16 @@ export class SlabManager {
    *
    * Before:  100M iterations for a 100MB genome.
    * After:   100 iterations (at 1MB slabSize) + 100 native memcpy calls.
+   *
+   * SLAB-META-01 FIX (2026-02-22):
+   *   Metadata is now updated INSIDE the while loop, immediately after each
+   *   slab.set() call. Previously only the last slab received a metadata
+   *   refresh; all intermediate slabs retained stale length = 0 values.
+   *
+   *   The update sets meta.length = offsetInSlab + toCopy, which is the
+   *   exclusive end of valid data within that slab after this write.
+   *   For a completely filled slab (toCopy === slabSize - offsetInSlab with
+   *   offsetInSlab = 0) this correctly yields slabSize.
    */
   appendBytes(data: Uint8Array): void {
     if (data.length === 0) return;
@@ -170,19 +191,22 @@ export class SlabManager {
       // ── SIMD-accelerated bulk copy (replaces the inner per-byte loop) ────
       slab.set(data.subarray(srcOffset, srcOffset + toCopy), offsetInSlab);
 
+      // ── SLAB-META-01 FIX: update this slab's metadata immediately ────────
+      // Every slab that is written to in this call gets an accurate `length`
+      // value, not just the final slab. This prevents stale length = 0 entries
+      // on intermediate slabs when a single appendBytes call spans slab
+      // boundaries (e.g. a 10MB append touching 10 × 1MB slabs).
+      const meta = this.slabMeta.get(slabIndex);
+      if (meta) {
+        meta.length = offsetInSlab + toCopy;
+      }
+
       srcOffset    += toCopy;
       globalOffset += toCopy;
     }
 
     // Update genomeLength once — kept outside the hot loop
     this.genomeLength += data.length;
-
-    // Refresh metadata for the last slab written
-    const lastSlabIndex = Math.floor((this.genomeLength - 1) / this.slabSize);
-    const lastSlabMeta = this.slabMeta.get(lastSlabIndex);
-    if (lastSlabMeta) {
-      lastSlabMeta.length = this.genomeLength % this.slabSize || this.slabSize;
-    }
   }
 
   getGenomeLength(): number {

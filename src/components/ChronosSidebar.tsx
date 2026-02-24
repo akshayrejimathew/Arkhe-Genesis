@@ -15,7 +15,7 @@ import {
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { supabase } from '@/lib/supabase';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore, type ArkheState } from '@/store';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));
 

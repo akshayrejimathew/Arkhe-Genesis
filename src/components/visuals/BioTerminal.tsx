@@ -5,8 +5,8 @@ import { motion } from 'framer-motion';
 import { Terminal, Trash2, Download } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
-import type { SystemLog } from '@/types/SystemLog';
+import { useArkheStore, type ArkheState } from '@/store';
+import type { SystemLog } from '@/store/types';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));
 

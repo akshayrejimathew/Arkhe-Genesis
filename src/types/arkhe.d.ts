@@ -10,6 +10,8 @@
  *     type is the only canonical definition. This closes SHADOW-04 (dual-
  *     definition type divergence) and eliminates the unsafe `as
  *     ExtendedProteinFold` cast in ProteinViewport.tsx.
+ *
+ *   - Removed dead types: WorkerRequest and WorkerResponse (no longer used).
  */
 
 // -------------------- Base Types --------------------
@@ -166,20 +168,6 @@ export interface SliceResponse {
   spliceSites?: SpliceSite[];
   isoforms?: SpliceIsoform[];
   proteinProperties?: ProteinProperties;
-}
-
-// -------------------- Worker Protocol --------------------
-export interface WorkerRequest {
-  type: string;
-  id?: string;
-  payload?: unknown;
-  transferables?: Transferable[];
-}
-
-export interface WorkerResponse {
-  type: string;
-  id?: string;
-  payload?: unknown;
 }
 
 // -------------------- PCR --------------------

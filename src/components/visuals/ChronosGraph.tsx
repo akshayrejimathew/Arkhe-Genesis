@@ -2,14 +2,14 @@
 
 import React, { useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { clsx } from 'clsx';
+import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { GitBranch, GitCommit, Clock } from 'lucide-react';
-import { useArkheStore } from '@/hooks/useArkheStore';
-import type { ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore } from '@/store';
+import type { ArkheState } from '@/store/types';
 import type { Commit, Branch } from '@/types/arkhe';
 
-const cn = (...inputs: any[]) => twMerge(clsx(inputs));
+const cn = (...inputs: ClassValue[]) => twMerge(clsx(inputs));
 
 interface GraphNode {
   commit: Commit;

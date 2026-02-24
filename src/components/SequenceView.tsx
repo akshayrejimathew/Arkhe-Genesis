@@ -6,7 +6,7 @@ import { motion } from 'framer-motion';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Dna } from 'lucide-react';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore, type ArkheState } from '@/store';
 import GhostRibbonOverlay from '@/components/visuals/GhostRibbonOverlay';
 import MolecularScissorView from '@/components/visuals/MolecularScissorView';
 import ThermodynamicHUD from '@/components/visuals/ThermodynamicHUD';

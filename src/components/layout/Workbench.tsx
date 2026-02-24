@@ -16,7 +16,7 @@ import {
   Shield,
   File,
 } from 'lucide-react';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore, type ArkheState } from '@/store';
 import ArkheLogo from '@/components/branding/ArkheLogo';
 import FileIngestor from '@/components/ingestion/FileIngestor';
 import SequenceView from '@/components/SequenceView';

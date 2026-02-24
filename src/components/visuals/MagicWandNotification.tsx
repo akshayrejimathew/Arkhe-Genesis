@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Wand2, Sparkles, Dna, CheckCircle2 } from 'lucide-react';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore, type ArkheState } from '@/store';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));
 
@@ -20,7 +20,7 @@ export default function MagicWandNotification({ onComplete }: MagicWandNotificat
 
   // Monitor auto-annotation completion
   const orfScanResult = useArkheStore((state: ArkheState) => state.orfScanResult);
-  const features = useArkheStore((state: ArkheState) => state.features);
+  const features = useArkheStore((state: ArkheState) => state.viewport.features);
 
   useEffect(() => {
     // Trigger when ORF scan completes (scanProgress reaches 1)

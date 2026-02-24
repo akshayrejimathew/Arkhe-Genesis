@@ -27,6 +27,8 @@
  *   Vector F — 429 handled explicitly; caller receives a result object whose
  *               rateLimitNotice field drives the orange UI notice.
  *   Vector F — method and warning fields populated on every code path.
+ *
+ *   Unsafe cast fix: (self as Window).postMessage → (self as unknown as DedicatedWorkerGlobalScope).postMessage
  */
 
 import type { ProteinFold } from '@/types/arkhe';
@@ -177,8 +179,8 @@ async function callESMAtlas(aminoAcids: string): Promise<ESMAtlasOutcome> {
 // ── Worker system log ─────────────────────────────────────────────────────────
 
 function postSystemLog(message: string, level: 'info' | 'warning' | 'error') {
-  if (typeof self !== 'undefined' && typeof (self as Window).postMessage === 'function') {
-    (self as Window).postMessage({
+  if (typeof self !== 'undefined' && typeof (self as unknown as DedicatedWorkerGlobalScope).postMessage === 'function') {
+    (self as unknown as DedicatedWorkerGlobalScope).postMessage({
       type:    'SYSTEM_LOG',
       payload: { timestamp: Date.now(), category: 'FOLD', message, level },
     });

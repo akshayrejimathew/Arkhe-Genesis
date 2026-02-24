@@ -4,7 +4,7 @@ import { useState, FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import ArkheLogo from '@/components/branding/ArkheLogo';
 import { supabase } from '@/lib/supabase';
-import { useArkheStore } from '@/hooks/useArkheStore';
+import { useArkheStore } from '@/store';
 
 /**
  * THE AIRLOCK - Login Page

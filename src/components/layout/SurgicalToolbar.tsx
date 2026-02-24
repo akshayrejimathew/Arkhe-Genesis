@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react';
 import { motion } from 'framer-motion';
-import { clsx } from 'clsx';
+import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { 
   Scissors, 
@@ -12,9 +12,9 @@ import {
   AlertCircle,
   CheckCircle2
 } from 'lucide-react';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore, type ArkheState } from '@/store';
 
-const cn = (...inputs: any[]) => twMerge(clsx(inputs));
+const cn = (...inputs: ClassValue[]) => twMerge(clsx(inputs));
 
 export default function SurgicalToolbar() {
   const [activeAction, setActiveAction] = useState<string | null>(null);

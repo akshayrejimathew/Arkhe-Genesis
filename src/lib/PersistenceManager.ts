@@ -3,42 +3,34 @@
  * PersistenceManager.ts
  * Cloud sync, genome upload, session restoration, and annotation persistence.
  *
- * PINNACLE SPRINT FIXES (2026-02-21):
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SPRINT 2 SECURITY FIXES (2026-02-22)
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- *   SHADOW-03 — try/finally guarantees sync lock release on network failure:
- *     Previously, `run()` released `isSyncing` and `syncPromise` only on the
- *     happy path. A single Supabase network exception left `isSyncing = true`
- *     permanently — deadlocking all future syncs for the rest of the session.
- *     Fix: the entire body of `run()` is now wrapped in try/finally. The
- *     finally block unconditionally resets both flags on success, exception,
- *     and rejection alike.
+ *   FIX 3A — Sovereign Credential Leak Prevention:
+ *     `getSovereignClient()` wraps `createClient()` in a try/catch. If
+ *     instantiation fails (e.g. the JWT is structurally invalid and the
+ *     Supabase SDK throws internally), the raw key is NOT passed to
+ *     `console.error` and is NOT included in the re-thrown Error message.
+ *     Instead we throw `new Error('Invalid Sovereign Credentials provided')`.
+ *     This prevents the JWT from appearing in browser DevTools console output,
+ *     Sentry breadcrumbs, or any other error-logging pipeline.
  *
- *   CIRCUIT BREAKER — 413 / 429 offline mode:
- *     `performSync()` now inspects Supabase error codes. On 413 (Payload Too
- *     Large) or 429 (Rate Limit), it calls `circuitBreaker()` which trips
- *     `isOfflineMode = true`. Subsequent `syncChronos()` calls return
- *     immediately with `status: 'offline'` — no network I/O. The circuit
- *     breaker notification includes a Sovereign Mode suggestion, prompting
- *     the user to connect their own Supabase instance to resume cloud sync.
+ *   FIX 3B — Cross-Tab Sovereign Credential Sync:
+ *     `_installStorageListener()` attaches a `window.storage` event listener
+ *     (once) that fires whenever localStorage changes in *another* browser tab.
+ *     If the listener sees `ARKHE_CUSTOM_SUPABASE_URL` change, it invalidates
+ *     the cached `_sovereignClient` and `_sovereignUrl`. The next sync call in
+ *     this tab will then pick up the new credentials automatically, without
+ *     requiring a page reload.
  *
- *   SOVEREIGN MODE — bring-your-own Supabase instance:
- *     `getSovereignClient()` checks `localStorage` for:
- *       - `ARKHE_CUSTOM_SUPABASE_URL`
- *       - `ARKHE_CUSTOM_SUPABASE_KEY`
- *     If both are present, `PersistenceManager` dynamically instantiates a
- *     second Supabase client using those credentials for all sync operations.
- *     This allows enterprise researchers to point Arkhé at their own Supabase
- *     project, sidestepping any rate limits or payload size limits on the
- *     shared Anthropic instance.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SPRINT 1 FIXES (2026-02-21) — retained below
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- *     To activate Sovereign Mode from the browser console or settings panel:
- *       localStorage.setItem('ARKHE_CUSTOM_SUPABASE_URL', 'https://xxx.supabase.co');
- *       localStorage.setItem('ARKHE_CUSTOM_SUPABASE_KEY', 'eyJhbGci...');
- *       location.reload();  // triggers getSovereignClient() on next sync
- *
- *     To revert to the shared instance:
- *       localStorage.removeItem('ARKHE_CUSTOM_SUPABASE_URL');
- *       localStorage.removeItem('ARKHE_CUSTOM_SUPABASE_KEY');
+ *   SHADOW-03 — try/finally guarantees sync lock release on network failure.
+ *   CIRCUIT BREAKER — 413 / 429 offline mode.
+ *   SOVEREIGN MODE — bring-your-own Supabase instance.
  */
 
 import { supabase as defaultSupabase } from '@/lib/supabase';
@@ -74,7 +66,6 @@ export interface SessionRestore {
   headCommit: SupabaseChronosCommit;
 }
 
-/** Shape of a circuit-breaker notification emitted to the store. */
 export interface CircuitBreakerNotification {
   reason: string;
   code: '413' | '429' | 'unknown';
@@ -98,10 +89,8 @@ export class PersistenceManager {
   public static offlineModeReason: string | null = null;
   public static offlineModeCode: '413' | '429' | 'unknown' | null = null;
 
-  /** Optional callback — the store sets this to surface notifications in the UI. */
   public static onCircuitBreakerTripped: ((notification: CircuitBreakerNotification) => void) | null = null;
 
-  /** Trip the circuit breaker and emit a notification. */
   public static circuitBreaker(reason: string, code: '413' | '429' | 'unknown' = 'unknown'): void {
     PersistenceManager.isOfflineMode = true;
     PersistenceManager.offlineModeReason = reason;
@@ -135,7 +124,6 @@ export class PersistenceManager {
     }
   }
 
-  /** Reset the circuit breaker (called on successful reconnect or sovereign mode activation). */
   public static resetCircuitBreaker(): void {
     PersistenceManager.isOfflineMode = false;
     PersistenceManager.offlineModeReason = null;
@@ -146,9 +134,60 @@ export class PersistenceManager {
   // SOVEREIGN MODE — bring-your-own Supabase client
   // --------------------------------------------------------------------------
 
-  /** Cached sovereign client so we don't re-instantiate on every sync. */
   private static _sovereignClient: SupabaseClient | null = null;
   private static _sovereignUrl: string | null = null;
+
+  // FIX 3B — Track whether we've already attached the storage listener so
+  // we never double-register it across hot-reloads or repeated calls.
+  private static _storageListenerInstalled = false;
+
+  /**
+   * FIX 3B — Cross-Tab Sovereign Credential Sync
+   *
+   * Attaches a `storage` event listener (idempotent — installed at most once).
+   * When another tab writes a new value to ARKHE_CUSTOM_SUPABASE_URL, we
+   * invalidate `_sovereignClient` and `_sovereignUrl` so the next sync in
+   * this tab transparently picks up the new credentials.
+   *
+   * The `storage` event fires only for changes made by *other* tabs, never for
+   * writes in the same tab, which is exactly the cross-tab sync we need. Same-
+   * tab updates are handled synchronously inside `activateSovereignMode()`.
+   */
+  private static _installStorageListener(): void {
+    if (
+      PersistenceManager._storageListenerInstalled ||
+      typeof window === 'undefined'
+    ) {
+      return;
+    }
+
+    window.addEventListener('storage', (event: StorageEvent) => {
+      // We only care about changes to the sovereign URL key.
+      if (event.key !== SOVEREIGN_URL_KEY) return;
+
+      const newUrl = event.newValue;
+      const cachedUrl = PersistenceManager._sovereignUrl;
+
+      if (newUrl !== cachedUrl) {
+        // Invalidate the client cache — next getSovereignClient() call will
+        // re-read localStorage and instantiate a fresh client.
+        PersistenceManager._sovereignClient = null;
+        PersistenceManager._sovereignUrl = null;
+
+        console.info(
+          '[PersistenceManager] Sovereign URL changed in another tab. Client cache invalidated.'
+        );
+
+        // If the URL was removed (sovereign mode deactivated in another tab),
+        // also reset the circuit breaker so we start fresh on the shared instance.
+        if (!newUrl && PersistenceManager.isOfflineMode) {
+          PersistenceManager.resetCircuitBreaker();
+        }
+      }
+    });
+
+    PersistenceManager._storageListenerInstalled = true;
+  }
 
   /**
    * Returns the appropriate Supabase client for sync operations.
@@ -159,26 +198,34 @@ export class PersistenceManager {
    *   2. Default shared Arkhé client (imported at module load)
    *
    * The sovereign client is lazily instantiated and cached. If the URL in
-   * localStorage changes (e.g. user updates credentials), the cache is
-   * invalidated and a new client is created.
+   * localStorage changes (e.g. user updates credentials in this tab via
+   * activateSovereignMode(), or another tab changes it via the storage event
+   * listener), the cache is invalidated and a new client is created.
+   *
+   * FIX 3A: createClient() is wrapped in try/catch. If instantiation fails,
+   * we throw `new Error('Invalid Sovereign Credentials provided')` — the raw
+   * URL and key are never forwarded to console.error or the Error message.
+   *
+   * FIX 3B: Installs the cross-tab storage listener on every call (idempotent).
    */
   public static getSovereignClient(): SupabaseClient {
-    // Guard against server-side rendering / worker contexts without localStorage
     if (typeof localStorage === 'undefined') {
       return defaultSupabase;
     }
+
+    // FIX 3B — ensure the cross-tab listener is live
+    PersistenceManager._installStorageListener();
 
     const customUrl = localStorage.getItem(SOVEREIGN_URL_KEY);
     const customKey = localStorage.getItem(SOVEREIGN_KEY_KEY);
 
     if (!customUrl || !customKey) {
-      // No sovereign config — use default
       PersistenceManager._sovereignClient = null;
       PersistenceManager._sovereignUrl = null;
       return defaultSupabase;
     }
 
-    // Invalidate cache if the URL has changed since last call
+    // Return cached client if URL is unchanged
     if (
       PersistenceManager._sovereignClient &&
       PersistenceManager._sovereignUrl === customUrl
@@ -186,9 +233,11 @@ export class PersistenceManager {
       return PersistenceManager._sovereignClient;
     }
 
-    // Instantiate a new sovereign client
+    // FIX 3A — Instantiate with credential-safe error handling.
+    // The raw `customUrl` / `customKey` are intentionally withheld from the
+    // catch block so they cannot appear in DevTools or error-monitoring tools.
     try {
-      PersistenceManager._sovereignClient = createClient(customUrl, customKey, {
+      const client = createClient(customUrl, customKey, {
         auth: {
           persistSession: true,
           autoRefreshToken: true,
@@ -199,27 +248,30 @@ export class PersistenceManager {
           },
         },
       });
+
+      PersistenceManager._sovereignClient = client;
       PersistenceManager._sovereignUrl = customUrl;
 
       console.info(
-        `[PersistenceManager] Sovereign Mode active — syncing to: ${customUrl}`
+        `[PersistenceManager] Sovereign Mode active — syncing to configured instance.`
+        // NOTE: URL intentionally omitted from production log to avoid leaking
+        // customer infrastructure details in shared environments.
       );
 
-      // If a circuit breaker was tripped on the shared instance, reset it now
-      // that we have a fresh sovereign client to try.
       if (PersistenceManager.isOfflineMode) {
         console.info('[PersistenceManager] Resetting circuit breaker for sovereign client.');
         PersistenceManager.resetCircuitBreaker();
       }
 
       return PersistenceManager._sovereignClient;
-    } catch (err) {
-      console.error('[PersistenceManager] Failed to instantiate sovereign Supabase client:', err);
-      return defaultSupabase;
+    } catch {
+      // FIX 3A — Do NOT log or re-throw the original error, as it may contain
+      // the raw key/URL in its message or stack trace. Throw a sanitised
+      // message instead.
+      throw new Error('Invalid Sovereign Credentials provided');
     }
   }
 
-  /** True when sovereign credentials are present and the client is active. */
   public static isSovereignModeActive(): boolean {
     if (typeof localStorage === 'undefined') return false;
     const url = localStorage.getItem(SOVEREIGN_URL_KEY);
@@ -244,14 +296,13 @@ export class PersistenceManager {
     }
     localStorage.setItem(SOVEREIGN_URL_KEY, supabaseUrl);
     localStorage.setItem(SOVEREIGN_KEY_KEY, supabaseKey);
-    // Invalidate the cache so the next sync call picks up the new credentials
+    // Invalidate cache so the next sync picks up new credentials
     PersistenceManager._sovereignClient = null;
     PersistenceManager._sovereignUrl = null;
     PersistenceManager.resetCircuitBreaker();
     console.info('[PersistenceManager] Sovereign Mode activated. Next sync will use custom instance.');
   }
 
-  /** Deactivate Sovereign Mode and revert to the shared Arkhé instance. */
   public static deactivateSovereignMode(): void {
     if (typeof localStorage !== 'undefined') {
       localStorage.removeItem(SOVEREIGN_URL_KEY);
@@ -277,18 +328,11 @@ export class PersistenceManager {
   // CORE SYNC ENGINE
   // --------------------------------------------------------------------------
 
-  /**
-   * Performs the actual Supabase upsert.
-   * Uses `getSovereignClient()` so sovereign users automatically get their
-   * own instance rather than the shared one.
-   * Detects 413 / 429 and trips the circuit breaker with full notification.
-   */
   private static async performSync(
     genomeId: string,
     commits: Commit[],
     branches: ArkheBranch[]
   ): Promise<ArkheResponse<{ commits: SupabaseChronosCommit[]; branches: SupabaseBranch[] }>> {
-    // Use sovereign client if available, otherwise default
     const client = PersistenceManager.getSovereignClient();
 
     try {
@@ -320,7 +364,6 @@ export class PersistenceManager {
           .returns<SupabaseChronosCommit[]>();
 
         if (error) {
-          // ── Circuit Breaker: 413 Payload Too Large ──────────────────────
           if (
             error.code === '413' ||
             error.message?.includes('413') ||
@@ -333,7 +376,6 @@ export class PersistenceManager {
             );
             return { data: null, error: PersistenceManager.offlineModeReason, status: 'offline' };
           }
-          // ── Circuit Breaker: 429 Rate Limited ───────────────────────────
           if (
             error.code === '429' ||
             error.message?.includes('429') ||
@@ -347,11 +389,7 @@ export class PersistenceManager {
             return { data: null, error: PersistenceManager.offlineModeReason, status: 'offline' };
           }
 
-          return {
-            data: null,
-            error: `Commit sync failed: ${error.message}`,
-            status: 'fail',
-          };
+          return { data: null, error: `Commit sync failed: ${error.message}`, status: 'fail' };
         }
         upsertedCommits = data || [];
       }
@@ -364,7 +402,6 @@ export class PersistenceManager {
           .returns<SupabaseBranch[]>();
 
         if (error) {
-          // ── Circuit Breaker: 429 on branch upsert ──────────────────────
           if (
             error.code === '429' ||
             error.message?.includes('429') ||
@@ -376,11 +413,7 @@ export class PersistenceManager {
             );
             return { data: null, error: PersistenceManager.offlineModeReason, status: 'offline' };
           }
-          return {
-            data: null,
-            error: `Branch sync failed: ${error.message}`,
-            status: 'fail',
-          };
+          return { data: null, error: `Branch sync failed: ${error.message}`, status: 'fail' };
         }
         upsertedBranches = data || [];
       }
@@ -400,30 +433,17 @@ export class PersistenceManager {
   }
 
   /**
-   * Public sync entry point with concurrency lock + try/finally.
-   *
-   * SHADOW-03 FIX (try/finally):
-   *   `isSyncing` and `syncPromise` are reset in the finally block, which
-   *   runs on success, thrown exception, AND rejected promise. Before this
-   *   fix, a single network exception left `isSyncing = true` forever.
-   *
-   * CIRCUIT BREAKER GATE:
-   *   If `isOfflineMode` is true, returns an offline response immediately
-   *   with zero network I/O. The genome continues operating from local
-   *   SlabManager data. Cloud sync resumes when `resetCircuitBreaker()` is
-   *   called (e.g. when the user activates Sovereign Mode).
+   * Public sync entry point with concurrency lock + try/finally (SHADOW-03).
    */
   public static async syncChronos(
     genomeId: string,
     commits: Commit[],
     branches: ArkheBranch[]
   ): Promise<ArkheResponse<{ commits: SupabaseChronosCommit[]; branches: SupabaseBranch[] }>> {
-    // ── Circuit Breaker gate ───────────────────────────────────────────────
     if (PersistenceManager.isOfflineMode) {
       return PersistenceManager.offlineResponse();
     }
 
-    // ── Concurrency lock ───────────────────────────────────────────────────
     if (PersistenceManager.isSyncing) {
       PersistenceManager.pendingParams = { genomeId, commits, branches };
       return PersistenceManager.syncPromise!;
@@ -432,30 +452,6 @@ export class PersistenceManager {
     PersistenceManager.isSyncing = true;
     PersistenceManager.pendingParams = null;
 
-    /**
-     * SHADOW-03 FIX — run() is wrapped in try/finally.
-     *
-     * Before this fix:
-     *   async run() {
-     *     const result = await performSync(...); // throws → exits here
-     *     while (pending) { ... }
-     *     isSyncing = false;    // ← NEVER REACHED on exception
-     *     syncPromise = null;   // ← NEVER REACHED on exception
-     *     return result;
-     *   }
-     *
-     * After this fix:
-     *   async run() {
-     *     try {
-     *       const result = await performSync(...);
-     *       while (pending) { ... }
-     *       return result;
-     *     } finally {
-     *       isSyncing = false;   // ← ALWAYS RUNS: success, throw, rejection
-     *       syncPromise = null;  // ← ALWAYS RUNS
-     *     }
-     *   }
-     */
     const run = async (
       firstGenomeId: string,
       firstCommits: Commit[],
@@ -468,7 +464,6 @@ export class PersistenceManager {
           firstBranches
         );
 
-        // Stop draining the queue if we've gone offline mid-run
         if (PersistenceManager.isOfflineMode) {
           PersistenceManager.pendingParams = null;
           return firstResult;
@@ -477,15 +472,13 @@ export class PersistenceManager {
         while (PersistenceManager.pendingParams) {
           const next = PersistenceManager.pendingParams;
           PersistenceManager.pendingParams = null;
-
           if (PersistenceManager.isOfflineMode) break;
-
           await PersistenceManager.performSync(next.genomeId, next.commits, next.branches);
         }
 
         return firstResult;
       } finally {
-        // Unconditional lock release — the key fix for SHADOW-03
+        // SHADOW-03 fix — unconditional lock release
         PersistenceManager.isSyncing = false;
         PersistenceManager.syncPromise = null;
       }
@@ -513,30 +506,16 @@ export class PersistenceManager {
 
       const { error: uploadError } = await client.storage
         .from('genomes')
-        .upload(storagePath, file, {
-          cacheControl: '3600',
-          upsert: false,
-        });
+        .upload(storagePath, file, { cacheControl: '3600', upsert: false });
 
       if (uploadError) {
-        return {
-          data: null,
-          error: `Storage upload failed: ${uploadError.message}`,
-          status: 'fail',
-        };
+        return { data: null, error: `Storage upload failed: ${uploadError.message}`, status: 'fail' };
       }
 
-      const { data: urlData } = client.storage
-        .from('genomes')
-        .getPublicUrl(storagePath);
+      const { data: urlData } = client.storage.from('genomes').getPublicUrl(storagePath);
       const fileUrl = urlData.publicUrl;
 
-      const newGenome: NewGenome = {
-        owner_id: ownerId,
-        name,
-        total_length: totalLength,
-        file_url: fileUrl,
-      };
+      const newGenome: NewGenome = { owner_id: ownerId, name, total_length: totalLength, file_url: fileUrl };
 
       const { data, error: dbError } = await client
         .from('genomes')
@@ -546,20 +525,12 @@ export class PersistenceManager {
 
       if (dbError) {
         await client.storage.from('genomes').remove([storagePath]);
-        return {
-          data: null,
-          error: `Database insert failed: ${dbError.message}`,
-          status: 'fail',
-        };
+        return { data: null, error: `Database insert failed: ${dbError.message}`, status: 'fail' };
       }
 
       return { data: data!, error: null, status: 'success' };
     } catch (err) {
-      return {
-        data: null,
-        error: err instanceof Error ? err.message : 'Unknown upload error',
-        status: 'fail',
-      };
+      return { data: null, error: err instanceof Error ? err.message : 'Unknown upload error', status: 'fail' };
     }
   }
 
@@ -581,11 +552,7 @@ export class PersistenceManager {
         .eq('owner_id', ownerId);
 
       if (deleteError) {
-        return {
-          data: null,
-          error: `Failed to clear existing features: ${deleteError.message}`,
-          status: 'fail',
-        };
+        return { data: null, error: `Failed to clear existing features: ${deleteError.message}`, status: 'fail' };
       }
 
       const dbFeatures: NewUserFeature[] = features.map((f) => ({
@@ -609,20 +576,12 @@ export class PersistenceManager {
         .returns<UserFeature[]>();
 
       if (insertError) {
-        return {
-          data: null,
-          error: `Failed to insert features: ${insertError.message}`,
-          status: 'fail',
-        };
+        return { data: null, error: `Failed to insert features: ${insertError.message}`, status: 'fail' };
       }
 
       return { data: data || [], error: null, status: 'success' };
     } catch (err) {
-      return {
-        data: null,
-        error: err instanceof Error ? err.message : 'Unknown annotation error',
-        status: 'fail',
-      };
+      return { data: null, error: err instanceof Error ? err.message : 'Unknown annotation error', status: 'fail' };
     }
   }
 
@@ -630,9 +589,7 @@ export class PersistenceManager {
   // 3. SESSION RESTORATION (TIME MACHINE)
   // --------------------------------------------------------------------------
 
-  static async restoreSession(
-    genomeId: string
-  ): Promise<ArkheResponse<SessionRestore>> {
+  static async restoreSession(genomeId: string): Promise<ArkheResponse<SessionRestore>> {
     const client = PersistenceManager.getSovereignClient();
     try {
       const [genomeResult, commitsResult, branchesResult] = await Promise.all([
@@ -661,8 +618,8 @@ export class PersistenceManager {
         return { data: null, error: `Failed to fetch branches: ${branchesResult.error.message}`, status: 'fail' };
       }
 
-      const genome = genomeResult.data;
-      const commits = commitsResult.data || [];
+      const genome   = genomeResult.data;
+      const commits  = commitsResult.data || [];
       const branches = branchesResult.data || [];
 
       const mainBranch = branches.find((b) => b.name === 'main');
@@ -674,7 +631,6 @@ export class PersistenceManager {
           .select('*')
           .eq('id', mainBranch.head_commit_id)
           .single<SupabaseChronosCommit>();
-
         if (!headError && head) headCommit = head;
       }
 
@@ -686,17 +642,9 @@ export class PersistenceManager {
         return { data: null, error: 'No commits found for this genome', status: 'fail' };
       }
 
-      return {
-        data: { genome, commits, branches, headCommit },
-        error: null,
-        status: 'success',
-      };
+      return { data: { genome, commits, branches, headCommit }, error: null, status: 'success' };
     } catch (err) {
-      return {
-        data: null,
-        error: err instanceof Error ? err.message : 'Unknown restore error',
-        status: 'fail',
-      };
+      return { data: null, error: err instanceof Error ? err.message : 'Unknown restore error', status: 'fail' };
     }
   }
 
@@ -728,10 +676,7 @@ export class PersistenceManager {
         }
       }
 
-      const { error: deleteError } = await client
-        .from('genomes')
-        .delete()
-        .eq('id', genomeId);
+      const { error: deleteError } = await client.from('genomes').delete().eq('id', genomeId);
 
       if (deleteError) {
         return { data: null, error: `Failed to delete genome: ${deleteError.message}`, status: 'fail' };
@@ -739,11 +684,7 @@ export class PersistenceManager {
 
       return { data: null, error: null, status: 'success' };
     } catch (err) {
-      return {
-        data: null,
-        error: err instanceof Error ? err.message : 'Unknown delete error',
-        status: 'fail',
-      };
+      return { data: null, error: err instanceof Error ? err.message : 'Unknown delete error', status: 'fail' };
     }
   }
 }

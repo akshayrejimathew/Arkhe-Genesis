@@ -3,7 +3,7 @@
  * React hook for protein folding – manages loading state and integrates with store.
  */
 
-import { useArkheStore } from './useArkheStore';
+import { useArkheStore } from '@/store';
 import { useEffect, useState } from 'react';
 import type { ProteinFold } from '@/lib/proteinFold';
 

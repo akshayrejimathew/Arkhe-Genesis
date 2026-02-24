@@ -4,8 +4,8 @@
  * Captures current session state and produces a signed Laboratory Certificate.
  */
 
-import { useArkheStore } from '@/hooks/useArkheStore';
-import type { SystemLog } from '@/types/SystemLog';
+import { useArkheStore } from '@/store';
+import type { SystemLog } from '@/store/types';
 
 export interface AuditReport {
   id: string;

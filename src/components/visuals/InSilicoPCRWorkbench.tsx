@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { FlaskConical, Zap, AlertTriangle, CheckCircle2, Loader2 } from 'lucide-react';
-import { useArkheStore } from '@/hooks/useArkheStore';
+import { useArkheStore } from '@/store';
 import type { PCRProduct } from '@/types/arkhe';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));

@@ -20,7 +20,7 @@ import { useRouter } from 'next/navigation';
 import type { Session } from '@supabase/supabase-js';
 import type { LucideIcon } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
-import { useArkheStore } from '@/hooks/useArkheStore';
+import { useArkheStore } from '@/store';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import {

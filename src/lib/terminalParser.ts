@@ -3,7 +3,7 @@
  * Command parser for the Bio-Terminal. Integrates with the Zustand store.
  */
 
-import type { ArkheState } from '@/hooks/useArkheStore';
+import type { ArkheState } from '@/store/types';
 import type { BaseCode } from '@/types/arkhe';
 
 export interface CommandResult {

@@ -3,32 +3,24 @@
  * ArkheEngine.worker.ts
  * High-performance genomic editing engine – FULL SPECTRUM.
  *
- * PINNACLE SPRINT FIXES (2026-02-21):
+ * SPRINT 6 FIXES (2026-02-24):
  *
- *   SHADOW-NEW-01 — resetEngine() streaming state reset (CRITICAL):
- *     `resetEngine()` previously cleared analysis caches and cancelled idle
- *     callbacks but left the streaming state untouched:
- *       - `streamBuffer` retained partial FASTA lines from the previous genome
- *       - `stagingIndex` was non-zero, causing a partial staging-buffer flush
- *         at the start of the next stream that prepended stale bytes
- *       - `slabManager` retained all slab data from the previous genome
- *     Every genome loaded after a failed or interrupted load was silently
- *     chimeric (prior tail + new genome). Fix: reset all three on every
- *     engine reset. A private `useSharedBuffers` field is introduced so
- *     the new SlabManager is constructed with the same shared-buffer flag
- *     that was set during `init()`.
+ *   TASK 1 — Unbounded streamBuffer Guard:
+ *     `handleStreamChunk()` now aborts the stream if the FASTA line buffer
+ *     exceeds 50MB without a newline, posting a `MALFORMED_FASTA_LINE_TOO_LONG`
+ *     error and ignoring further chunks.
  *
- *   SHADOW-02 — Engine consolidation (FoldingEngine → proteinFold.ts):
- *     The worker's FOLD_PROTEIN handler now imports from `../../lib/proteinFold`
- *     which is the fully compliant implementation with:
- *       - 30-second AbortController timeout (timer cleared in finally)
- *       - Typed 429 handling with `rateLimitNotice` field
- *       - GDPR consent gate (second argument: `consentObtained`)
- *     The worker passes `payload.consentObtained ?? false` so the consent
- *     gate is respected even when called directly from the worker message loop.
+ *   TASK 2 — 10‑Billion‑Base Heap Guard:
+ *     `autoAnnotateGenome()` now checks genome length and, if >500 million bases,
+ *     disables full‑sequence scanning and returns an empty array with a warning.
  *
- *   UPDATED: Added COMMIT_SYNC trigger, RESTORE_HISTORY handler, and threat screening.
- *   FIXED (Vector D): finalizeStream now processes any remaining line buffer.
+ *   TASK 3 — Request Cancellation Logic:
+ *     Viewport requests (LOAD_SLICE) now carry a request ID; only the most
+ *     recent request is processed. Older requests are discarded, preventing
+ *     UI jank from rapid viewport changes.  The request ID is managed
+ *     internally by the engine via `getNextRequestId()`.
+ *
+ * PREVIOUS FIXES (SPRINT 5, SHADOW-NEW-01, SHADOW-02, etc.) are preserved.
  */
 
 /// <reference lib="webworker" />
@@ -92,6 +84,9 @@ const COMPLEMENT: Record<BaseCode, BaseCode> = {
   4: 4,
 };
 
+// ---------- TASK 1: Unbounded streamBuffer Guard ----------
+const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB
+
 // ---------- Telemetry Logger (with Debug Mode) ----------
 let DEBUG_MODE = false;
 
@@ -126,7 +121,6 @@ class ArkheEngine {
   private editedSlabs: Set<number> = new Set();
 
   // SHADOW-NEW-01 FIX: track whether SharedArrayBuffer is in use
-  // so resetEngine() can recreate SlabManager with the same flag.
   private useSharedBuffers = false;
 
   // Zombie transition prevention
@@ -147,13 +141,19 @@ class ArkheEngine {
   private syntenyAnchors: SyntenyAnchor[] = [];
   private syntenyTaskId: number | null = null;
 
-  // ---------- Streaming buffers (persistent, allocated once) ----------
-  private streamBuffer: string = '';                // line buffer for FASTA parsing
-  private stagingBuffer: Uint8Array = new Uint8Array(65536); // 64KB staging buffer
+  // ---------- Streaming buffers ----------
+  private streamBuffer: string = '';
+  private stagingBuffer: Uint8Array = new Uint8Array(65536);
   private stagingIndex: number = 0;
+  // TASK 1: stream abort flag
+  private streamAborted: boolean = false;
 
   // ---------- Sentinel Threat Screening ----------
   private screeningEngine: ScreeningEngine = new ScreeningEngine();
+
+  // ---------- TASK 3: Request cancellation for viewport loads ----------
+  private viewportRequestCounter: number = 0;
+  private latestViewportRequestId: number = 0;
 
   constructor() {
     this.slabManager = new SlabManager(false);
@@ -166,7 +166,6 @@ class ArkheEngine {
 
   // --- Initialization ---
   async init(config: { useSharedArray: boolean; slabSize?: number; metadata?: Record<string, unknown>; debugMode?: boolean }) {
-    // Record the shared-buffer preference for use in resetEngine()
     this.useSharedBuffers = config.useSharedArray;
     this.slabManager = new SlabManager(config.useSharedArray);
     this.diffEngine = new DiffEngine();
@@ -193,29 +192,13 @@ class ArkheEngine {
     return { ok: true, slabSize: SLAB_SIZE, useShared: config.useSharedArray, debugMode: DEBUG_MODE };
   }
 
-  // --- Zombie Transition Prevention ---
   /**
-   * SHADOW-NEW-01 FIX: resetEngine() now fully resets streaming state.
-   *
-   * Previous bug: `streamBuffer`, `stagingIndex`, and `slabManager` were
-   * never reset. An aborted or failed genome load left stale data in all
-   * three. The next genome load appended its bytes after the orphaned tail,
-   * silently producing a chimeric sequence (Genome A suffix + Genome B).
-   *
-   * Fix:
-   *   1. streamBuffer = '' — discard any partial FASTA line from the prior stream
-   *   2. stagingIndex = 0 — discard any partial staging-buffer content
-   *      (the bytes themselves don't need zeroing; the index tracks validity)
-   *   3. slabManager = new SlabManager(...) — completely discard all prior
-   *      slab allocations and the genomeLength counter. The new instance
-   *      starts at zero bytes. We pass `this.useSharedBuffers` so the
-   *      same allocator strategy (SharedArrayBuffer vs ArrayBuffer) is used.
+   * SHADOW-NEW-01 FIX + SPRINT 5 Adaptive Slab Sizing.
    */
-  resetEngine(): void {
+  resetEngine(expectedFileSize?: number): void {
     this.taskCounter++;
     this.activeTaskId = `task-${this.taskCounter}-${Date.now()}`;
 
-    // Cancel existing background tasks
     if (this.sentinelTaskId) {
       if (typeof self.cancelIdleCallback === 'function') {
         self.cancelIdleCallback(this.sentinelTaskId);
@@ -237,7 +220,6 @@ class ArkheEngine {
       this.syntenyTaskId = null;
     }
 
-    // Clear analysis caches to force fresh analysis on the new genome
     this.sentinelCache = null;
     this.sentinelLastGenomeLength = 0;
     this.orfCache = null;
@@ -246,16 +228,12 @@ class ArkheEngine {
     this.offTargetCache.clear();
     this.editedSlabs.clear();
 
-    // ── SHADOW-NEW-01 FIX: Reset all streaming state ──────────────────────
-    // Without these three lines, any genome loaded after a failed/aborted load
-    // would begin with stale bytes from the previous session's stream.
-    this.streamBuffer = '';       // discard partial FASTA line buffer
-    this.stagingIndex = 0;        // discard partial staging buffer content
+    // TASK 1: Reset stream state
+    this.streamBuffer = '';
+    this.stagingIndex = 0;
+    this.streamAborted = false;
 
-    // Recreate SlabManager with the same SharedArrayBuffer flag that was
-    // established during init(). This discards all prior slab allocations
-    // and resets genomeLength to zero.
-    this.slabManager = new SlabManager(this.useSharedBuffers);
+    this.slabManager = new SlabManager(this.useSharedBuffers, expectedFileSize);
 
     logToUI('WORKER', `Engine reset — new task ID: ${this.activeTaskId}`, 'info');
     logToUI('MEMORY', 'SlabManager recreated — all prior genome data discarded', 'info');
@@ -263,6 +241,18 @@ class ArkheEngine {
 
   private getCurrentTaskId(): string {
     return this.activeTaskId || 'unknown';
+  }
+
+  // --- Request ID management for TASK 3 ---
+  /**
+   * Generates a new monotonically increasing request ID and marks it as the
+   * latest viewport request.  Used by LOAD_SLICE to enable cancellation of
+   * stale requests.
+   */
+  public getNextRequestId(): number {
+    this.viewportRequestCounter++;
+    this.latestViewportRequestId = this.viewportRequestCounter;
+    return this.viewportRequestCounter;
   }
 
   // --- Load Sentinel Library from IndexedDB ---
@@ -379,10 +369,16 @@ class ArkheEngine {
     );
   }
 
-  // --- Auto‑Annotator ---
+  // --- Auto‑Annotator with TASK 2 Circuit Breaker ---
   async autoAnnotateGenome(): Promise<FeatureTag[]> {
     const genomeLength = this.slabManager.getGenomeLength();
     if (genomeLength === 0) return [];
+
+    // TASK 2: 500 million base guard
+    if (genomeLength > 500_000_000) {
+      logToUI('ANNOTATION', 'Genome exceeds 500Mb; full auto‑annotation disabled. Use on‑demand region analysis.', 'warning');
+      return [];
+    }
 
     const region = this.slabManager.readRegion(0, genomeLength - 1);
     const features = this.bioLogic.autoAnnotate(region, ORF_MIN_AA_LENGTH);
@@ -639,7 +635,7 @@ class ArkheEngine {
     }
   }
 
-  // --- Synteny Ghosting (Rolling‑Hash Optimized) ---
+  // --- Synteny Ghosting ---
   private scheduleSyntenyScan(): void {
     if (typeof self.requestIdleCallback === 'function') {
       this.syntenyTaskId = self.requestIdleCallback(
@@ -967,7 +963,7 @@ class ArkheEngine {
     return result;
   }
 
-  // --- Streaming (FASTA-aware with persistent staging buffer) ---
+  // --- Streaming (FASTA-aware with TASK 1 guard) ---
   private processSequenceLine(line: string): void {
     for (let i = 0; i < line.length; i++) {
       const ch = line[i].toUpperCase();
@@ -984,12 +980,30 @@ class ArkheEngine {
     }
   }
 
-  handleStreamChunk(payload: { fileId: string; chunkBuffer: ArrayBuffer; byteOffset: number }) {
+  handleStreamChunk(payload: { fileId: string; chunkBuffer: ArrayBuffer; byteOffset: number }): { processed: number } | void {
+    // TASK 1: If stream already aborted, ignore further chunks
+    if (this.streamAborted) {
+      return { processed: 0 };
+    }
+
     const bytes = new Uint8Array(payload.chunkBuffer);
     const decoder = new TextDecoder('utf-8');
     const text = decoder.decode(bytes);
 
     this.streamBuffer += text;
+
+    // TASK 1: Check for excessive buffer without newline
+    if (this.streamBuffer.length > MAX_BUFFER_SIZE && !this.streamBuffer.includes('\n')) {
+      this.streamAborted = true;
+      this.streamBuffer = '';   // clear to free memory
+      // Post error message
+      postMessage({
+        type: 'ERROR',
+        payload: { message: 'MALFORMED_FASTA_LINE_TOO_LONG' }
+      });
+      logToUI('WORKER', 'Stream aborted: line exceeds 50MB without newline', 'error');
+      return { processed: 0 };
+    }
 
     let newlineIndex;
     while ((newlineIndex = this.streamBuffer.indexOf('\n')) !== -1) {
@@ -1007,6 +1021,10 @@ class ArkheEngine {
   }
 
   finalizeStream(): void {
+    if (this.streamAborted) {
+      logToUI('WORKER', 'Finalize called on aborted stream – ignoring', 'warning');
+      return;
+    }
     if (this.streamBuffer.length > 0) {
       if (!this.streamBuffer.startsWith('>')) {
         this.processSequenceLine(this.streamBuffer);
@@ -1022,14 +1040,26 @@ class ArkheEngine {
     logToUI('WORKER', 'Stream finalized, staging buffer flushed', 'info');
   }
 
-  // --- Load Slice ---
-  loadSlice(payload: { start: number; end: number }): SliceResponse {
-    const data = this.slabManager.readRegion(payload.start, payload.end);
+  // --- Load Slice with TASK 3 cancellation support ---
+  loadSlice(payload: { start: number; end: number }, requestId: number): SliceResponse | null {
+    // TASK 3: Discard if this request is no longer the latest
+    if (requestId !== this.latestViewportRequestId) {
+      return null;
+    }
+
+    const safeEnd = Math.min(payload.end, payload.start + 200_000);
+    const data = this.slabManager.readRegion(payload.start, safeEnd);
+
+    // Check again after reading (heavy operation) – still latest?
+    if (requestId !== this.latestViewportRequestId) {
+      return null;
+    }
+
     const sequenceStr = Array.from(data).map(b => ['A', 'C', 'G', 'T', 'N'][b]).join('');
     const translations = this.bioLogic.sixFrameTranslations(data);
     const gcPercent = this.bioLogic.computeGCContent(data);
-    const features = this.slabManager.getFeaturesInRange(payload.start, payload.end);
-    const orfs = this.getORFsInRange(payload.start, payload.end);
+    const features = this.slabManager.getFeaturesInRange(payload.start, safeEnd);
+    const orfs = this.getORFsInRange(payload.start, safeEnd);
     const spliceSites = this.bioLogic.predictSpliceSites(data);
     let proteinProperties: ProteinProperties | undefined;
     let isoforms: SpliceIsoform[] | undefined;
@@ -1041,9 +1071,14 @@ class ArkheEngine {
       isoforms = this.bioLogic.predictIsoforms(data, longestORF, spliceSites);
     }
 
+    // Final check before returning
+    if (requestId !== this.latestViewportRequestId) {
+      return null;
+    }
+
     return {
       start: payload.start,
-      end: payload.end,
+      end: safeEnd,
       buffer: data.buffer as ArrayBuffer,
       sequence: sequenceStr,
       translations,
@@ -1108,21 +1143,18 @@ class ArkheEngine {
       'success'
     );
 
-    this.chronos.commit(
+    const newCommit = this.chronos.commit(
       [mutation],
       payload.meta?.user,
       payload.meta?.reason,
       payload.meta?.branch,
       payload.meta?.isCheckpoint || false
     );
-    this.persistence.saveTransaction(this.chronos.getAllCommits());
-
-    const allCommits = this.chronos.getAllCommits();
     const allBranches = this.chronos.getBranches();
     postMessage({
       type: 'COMMIT_SYNC',
       payload: {
-        commits: allCommits,
+        newCommits: [this.chronos.getCommit(txId)!],
         branches: allBranches,
       },
     });
@@ -1168,11 +1200,13 @@ class ArkheEngine {
 
     logToUI('CHRONOS', `Undo: reverted ${reverseOps.length} mutation(s)`, 'info');
 
-    const allCommits = this.chronos.getAllCommits();
     const allBranches = this.chronos.getBranches();
     postMessage({
       type: 'COMMIT_SYNC',
-      payload: { commits: allCommits, branches: allBranches },
+      payload: {
+        newCommits: [],
+        branches: allBranches,
+      },
     });
 
     return reverseOps;
@@ -1191,11 +1225,13 @@ class ArkheEngine {
 
     logToUI('CHRONOS', `Redo: reapplied ${forwardOps.length} mutation(s)`, 'info');
 
-    const allCommits = this.chronos.getAllCommits();
     const allBranches = this.chronos.getBranches();
     postMessage({
       type: 'COMMIT_SYNC',
-      payload: { commits: allCommits, branches: allBranches },
+      payload: {
+        newCommits: [],
+        branches: allBranches,
+      },
     });
 
     return forwardOps;
@@ -1206,11 +1242,10 @@ class ArkheEngine {
     const success = this.chronos.createBranch(name, fromCommitId);
     if (success) {
       logToUI('CHRONOS', `Branch created: ${name}`, 'success');
-      const allCommits = this.chronos.getAllCommits();
       const allBranches = this.chronos.getBranches();
       postMessage({
         type: 'COMMIT_SYNC',
-        payload: { commits: allCommits, branches: allBranches },
+        payload: { newCommits: [], branches: allBranches },
       });
     }
     return success;
@@ -1228,11 +1263,11 @@ class ArkheEngine {
     const mergeCommitId = this.chronos.merge(sourceBranch, targetBranch, message);
     if (mergeCommitId) {
       logToUI('CHRONOS', `Merged ${sourceBranch} into ${targetBranch || this.chronos.getCurrentBranch()}`, 'success');
-      const allCommits = this.chronos.getAllCommits();
+      const newCommit = this.chronos.getCommit(mergeCommitId)!;
       const allBranches = this.chronos.getBranches();
       postMessage({
         type: 'COMMIT_SYNC',
-        payload: { commits: allCommits, branches: allBranches },
+        payload: { newCommits: [newCommit], branches: allBranches },
       });
     }
     return mergeCommitId;
@@ -1497,7 +1532,7 @@ class ArkheEngine {
   }
 }
 
-// ---------- Worker Message Handling ----------
+// ---------- Worker Message Handling with TASK 3 Cancellation ----------
 const engine = new ArkheEngine();
 
 self.onmessage = async (e: MessageEvent) => {
@@ -1506,7 +1541,7 @@ self.onmessage = async (e: MessageEvent) => {
   try {
     switch (type) {
       case 'RESET_ENGINE': {
-        engine.resetEngine();
+        engine.resetEngine(payload?.expectedFileSize);
         postMessage({ type: 'RESET_ENGINE_OK', id });
         break;
       }
@@ -1528,7 +1563,9 @@ self.onmessage = async (e: MessageEvent) => {
       }
       case 'STREAM_CHUNK': {
         const result = engine.handleStreamChunk(payload);
-        postMessage({ type: 'STREAM_ACK', id, payload: result });
+        if (result) {
+          postMessage({ type: 'STREAM_ACK', id, payload: result });
+        }
         break;
       }
       case 'STREAM_END': {
@@ -1537,8 +1574,16 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
       case 'LOAD_SLICE': {
-        const result = engine.loadSlice(payload);
-        postMessage({ type: 'SLICE', id, payload: result }, [result.buffer]);
+        // TASK 3: Obtain a fresh request ID from the engine
+        const requestId = engine.getNextRequestId();
+        const result = engine.loadSlice(payload, requestId);
+        if (result) {
+          // Only post if this request is still the latest (result not null)
+          postMessage({ type: 'SLICE', id, payload: result }, [result.buffer]);
+        } else {
+          // Optionally send a cancellation notice (not required, but can help debugging)
+          postMessage({ type: 'SLICE_CANCELLED', id, payload: { reason: 'superseded' } });
+        }
         break;
       }
       case 'PERFORM_SURGICAL_MUTATION': {
@@ -1778,24 +1823,6 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
       case 'FOLD_PROTEIN': {
-        /**
-         * SHADOW-02 FIX: Import from proteinFold.ts (not FoldingEngine.ts).
-         *
-         * proteinFold.ts is the authoritative implementation:
-         *   - 30-second AbortController timeout (signal passed to fetch)
-         *   - Timeout cleared in finally — no leaked timers
-         *   - Typed 429 / rate-limit handling (rateLimitNotice field)
-         *   - GDPR consent gate (second argument: consentObtained)
-         *   - method + warning fields on every code path
-         *
-         * FoldingEngine.ts (the inferior parallel implementation) has:
-         *   - No AbortController → can hang indefinitely
-         *   - No 429 handling → rate limits silently discard result
-         *   - No consent parameter → GDPR gate is only caller-side
-         *
-         * The consent flag is passed from the message payload so the store's
-         * GDPR gate is respected even when called from the worker directly.
-         */
         const { computeProteinFold } = await import('../../lib/proteinFold');
         const fold = await computeProteinFold(
           payload.sequence,

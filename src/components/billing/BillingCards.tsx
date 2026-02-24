@@ -2,107 +2,95 @@
 
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Check, Zap, Crown, Sparkles } from 'lucide-react';
+import { Check, Zap, Crown, Sparkles, type LucideIcon } from 'lucide-react';
 
-type Tier = 'architect' | 'demiurge' | 'pantheon';
+type EngineTier = 'local' | 'sovereign' | 'enterprise';
 
-interface BillingTier {
-  id: Tier;
+interface EngineCard {
+  id: EngineTier;
   name: string;
   tagline: string;
   price: string;
-  period: string;
   features: string[];
   highlighted?: boolean;
-  icon: any;
+  icon: LucideIcon;
   gradient: string;
 }
 
 interface BillingCardsProps {
-  currentTier: Tier;
-  onSelectTier: (tier: Tier) => void;
+  currentTier: EngineTier;
+  onSelectTier: (tier: EngineTier) => void;
 }
 
 /**
- * BILLING POWER CARDS - Legendary Tier Selection
- * Features: Glass-morphism, Liquid border for Demiurge, Premium animations
+ * COMPUTE ENGINE SELECTION – Sovereign Pivot
+ * Replaces the billing UI with a choice of deployment environments.
  */
 export default function BillingCards({ currentTier, onSelectTier }: BillingCardsProps) {
-  const [hoveredTier, setHoveredTier] = useState<Tier | null>(null);
+  const [hoveredTier, setHoveredTier] = useState<EngineTier | null>(null);
 
-  const tiers: BillingTier[] = [
+  const engines: EngineCard[] = [
     {
-      id: 'architect',
-      name: 'Architect',
-      tagline: 'Build in solitude',
-      price: 'Free',
-      period: 'forever',
+      id: 'local',
+      name: 'Local Arkhé',
+      tagline: 'Edge‑only execution',
+      price: 'Edge‑Only',
       icon: Sparkles,
       gradient: 'from-zinc-600 to-zinc-800',
       features: [
-        'Local genome editing',
-        'Basic sequence analysis',
-        'Export to FASTA/GenBank',
-        'Community support',
+        'Local Browser Engine',
+        'Privacy‑First Persistence',
+        'Standard Worker Throughput',
       ],
     },
     {
-      id: 'demiurge',
-      name: 'Demiurge',
-      tagline: 'Command the genome',
-      price: '$20',
-      period: 'per month',
+      id: 'sovereign',
+      name: 'Sovereign Shield',
+      tagline: 'Your infrastructure',
+      price: 'Custom Vault',
       icon: Zap,
       gradient: 'from-cyan-500 via-blue-500 to-purple-600',
       highlighted: true,
       features: [
-        'Everything in Architect',
-        'Chronos Cloud Sync',
-        'Protein folding prediction',
-        'Advanced Sentinel rules',
-        'Priority support',
-        'Collaboration tools',
+        'Your Personal Supabase',
+        'Encrypted Cloud Sync',
+        'Remote Forensic Snapshots',
       ],
     },
     {
-      id: 'pantheon',
-      name: 'Pantheon',
-      tagline: 'Enterprise sovereignty',
-      price: 'Custom',
-      period: 'contact us',
+      id: 'enterprise',
+      name: 'Enterprise Genesis',
+      tagline: 'Cluster‑grade scale',
+      price: 'Cluster Grade',
       icon: Crown,
       gradient: 'from-amber-500 via-rose-500 to-purple-600',
       features: [
-        'Everything in Demiurge',
-        'Custom Sentinel rules',
-        'SSO & SAML',
-        'Dedicated infrastructure',
-        'SLA guarantee',
-        'White-label options',
-        'On-premise deployment',
+        'Shared Array Buffers',
+        'Multi‑Genome Comparisons',
+        'Dedicated Node‑Gossip Engine',
       ],
     },
   ];
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      {tiers.map((tier) => {
-        const Icon = tier.icon;
-        const isActive = currentTier === tier.id;
-        const isHovered = hoveredTier === tier.id;
-        const isDemiurge = tier.id === 'demiurge';
+      {engines.map((engine) => {
+        const Icon = engine.icon;
+        const isActive = currentTier === engine.id;
+        const isHovered = hoveredTier === engine.id;
+        const isSovereign = engine.id === 'sovereign';
 
         return (
           <motion.div
-            key={tier.id}
+            key={engine.id}
             className="relative"
-            onHoverStart={() => setHoveredTier(tier.id)}
+            onHoverStart={() => setHoveredTier(engine.id)}
             onHoverEnd={() => setHoveredTier(null)}
             whileHover={{ y: -8 }}
             transition={{ duration: 0.2 }}
           >
-            {/* Liquid Border for Demiurge */}
-            {isDemiurge && (
+            {/* Liquid Border for Sovereign (formerly Demiurge) */}
+            {isSovereign && (
               <motion.div
                 className="absolute inset-0 rounded-xl overflow-hidden"
                 style={{
@@ -129,12 +117,12 @@ export default function BillingCards({ currentTier, onSelectTier }: BillingCards
             <div
               className={`
                 relative h-full flex flex-col rounded-xl overflow-hidden
-                ${isDemiurge ? '' : 'border border-razor'}
+                ${isSovereign ? '' : 'border border-razor'}
                 ${isActive ? 'ring-2 ring-cyan-500/50' : ''}
                 backdrop-blur-xl
               `}
               style={{
-                background: isDemiurge
+                background: isSovereign
                   ? 'linear-gradient(135deg, rgba(9, 9, 11, 0.95), rgba(24, 24, 27, 0.95))'
                   : 'rgba(24, 24, 27, 0.8)',
               }}
@@ -145,9 +133,9 @@ export default function BillingCards({ currentTier, onSelectTier }: BillingCards
                   className="absolute inset-0 opacity-20 pointer-events-none"
                   animate={{
                     background: [
-                      `radial-gradient(circle at 0% 0%, ${tier.gradient.split(' ')[0].replace('from-', '')} 0%, transparent 50%)`,
-                      `radial-gradient(circle at 100% 100%, ${tier.gradient.split(' ')[2] || tier.gradient.split(' ')[1]?.replace('to-', '')} 0%, transparent 50%)`,
-                      `radial-gradient(circle at 0% 0%, ${tier.gradient.split(' ')[0].replace('from-', '')} 0%, transparent 50%)`,
+                      `radial-gradient(circle at 0% 0%, ${engine.gradient.split(' ')[0].replace('from-', '')} 0%, transparent 50%)`,
+                      `radial-gradient(circle at 100% 100%, ${engine.gradient.split(' ')[2] || engine.gradient.split(' ')[1]?.replace('to-', '')} 0%, transparent 50%)`,
+                      `radial-gradient(circle at 0% 0%, ${engine.gradient.split(' ')[0].replace('from-', '')} 0%, transparent 50%)`,
                     ],
                   }}
                   transition={{
@@ -159,8 +147,8 @@ export default function BillingCards({ currentTier, onSelectTier }: BillingCards
 
               {/* Content */}
               <div className="relative p-6 flex-1 flex flex-col">
-                {/* Recommended Badge */}
-                {tier.highlighted && (
+                {/* Recommended Badge (now for Sovereign) */}
+                {engine.highlighted && (
                   <div className="absolute top-4 right-4">
                     <div className="px-3 py-1 bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full text-[9px] font-black uppercase tracking-wider text-white shadow-glow-cyan">
                       Recommended
@@ -171,7 +159,7 @@ export default function BillingCards({ currentTier, onSelectTier }: BillingCards
                 {/* Icon */}
                 <div className="mb-4">
                   <div 
-                    className={`inline-flex p-3 rounded-lg bg-gradient-to-br ${tier.gradient}`}
+                    className={`inline-flex p-3 rounded-lg bg-gradient-to-br ${engine.gradient}`}
                     style={{
                       boxShadow: isHovered ? '0 0 30px currentColor' : '0 0 15px currentColor',
                       transition: 'box-shadow 0.3s'
@@ -184,24 +172,21 @@ export default function BillingCards({ currentTier, onSelectTier }: BillingCards
                 {/* Header */}
                 <div className="mb-6">
                   <h3 className="text-2xl font-black uppercase tracking-wider text-white mb-1">
-                    {tier.name}
+                    {engine.name}
                   </h3>
-                  <p className="text-xs text-zinc-500 italic">{tier.tagline}</p>
+                  <p className="text-xs text-zinc-500 italic">{engine.tagline}</p>
                 </div>
 
-                {/* Price */}
+                {/* Price (now deployment type) */}
                 <div className="mb-6">
                   <div className="flex items-baseline gap-2">
-                    <span className="text-4xl font-black text-white">{tier.price}</span>
-                    {tier.period !== 'forever' && (
-                      <span className="text-sm text-zinc-600">/ {tier.period}</span>
-                    )}
+                    <span className="text-4xl font-black text-white">{engine.price}</span>
                   </div>
                 </div>
 
                 {/* Features */}
                 <ul className="space-y-3 mb-8 flex-1">
-                  {tier.features.map((feature, index) => (
+                  {engine.features.map((feature, index) => (
                     <motion.li
                       key={index}
                       className="flex items-start gap-2 text-sm"
@@ -215,22 +200,22 @@ export default function BillingCards({ currentTier, onSelectTier }: BillingCards
                   ))}
                 </ul>
 
-                {/* CTA Button */}
+                {/* Select Button */}
                 <button
-                  onClick={() => onSelectTier(tier.id)}
+                  onClick={() => onSelectTier(engine.id)}
                   className={`
                     w-full py-3 px-4 rounded-lg font-bold text-sm uppercase tracking-wider
                     transition-all
                     ${isActive
                       ? 'bg-zinc-800 text-zinc-500 cursor-default'
-                      : isDemiurge
+                      : isSovereign
                       ? 'bg-gradient-to-r from-cyan-500 to-blue-500 text-white hover:shadow-glow-cyan'
                       : 'bg-void-surface border border-razor text-zinc-300 hover:bg-void-elevated hover:border-subtle'
                     }
                   `}
                   disabled={isActive}
                 >
-                  {isActive ? 'Current Plan' : tier.price === 'Custom' ? 'Contact Sales' : 'Upgrade'}
+                  {isActive ? 'Current Environment' : 'Select'}
                 </button>
               </div>
             </div>

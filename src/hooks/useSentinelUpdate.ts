@@ -10,7 +10,7 @@
 
 import { useEffect } from 'react';
 import { get, set } from 'idb-keyval';
-import { useArkheStore } from './useArkheStore';
+import { useArkheStore } from '@/store';
 import type { SignatureLibrary } from '@/lib/sentinel/ScreeningEngine';
 
 const SIGNATURE_STORAGE_KEY = 'arkhe_sentinel_signatures';

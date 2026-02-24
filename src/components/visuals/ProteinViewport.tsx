@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Loader2, RotateCw, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore, type ArkheState } from '@/store';
 import type { ProteinFold } from '@/types/arkhe';
 
 /**

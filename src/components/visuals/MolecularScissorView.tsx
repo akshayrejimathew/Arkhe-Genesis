@@ -5,7 +5,7 @@ import { motion } from 'framer-motion';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { Scissors } from 'lucide-react';
-import { useArkheStore, type ArkheState } from '@/hooks/useArkheStore';
+import { useArkheStore, type ArkheState } from '@/store';
 import type { RestrictionSite } from '@/types/arkhe';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));

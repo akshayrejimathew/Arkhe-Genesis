@@ -3,7 +3,7 @@
 import { motion } from 'framer-motion';
 import { AlertTriangle, MapPin } from 'lucide-react';
 import { useState } from 'react';
-import { useArkheStore } from '@/hooks/useArkheStore';
+import { useArkheStore } from '@/store';
 import type { ThreatMatch } from '@/lib/sentinel/ScreeningEngine';
 
 interface OffTargetHeatmapProps {
