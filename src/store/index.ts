@@ -88,8 +88,7 @@ export const useArkheStore = create<ArkheState>()(
 // barrel rather than navigating to types.ts directly.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type { ArkheState } from './types';
-export type { Viewport, PendingMutation } from './types';
+export type { ArkheState, Viewport, PendingMutation, ProteinFold } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § Selectors — Genome / Worker

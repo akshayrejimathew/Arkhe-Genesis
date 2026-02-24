@@ -121,7 +121,7 @@ export default function MagicWandNotification({ onComplete }: MagicWandNotificat
                   <StatCard
                     icon={<Sparkles className="w-5 h-5" />}
                     label="Features"
-                    value={features.length}
+                    value={features?.length || 0}
                     color="cyan"
                   />
                   <StatCard

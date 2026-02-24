@@ -5,7 +5,7 @@
 
 import { useArkheStore } from '@/store';
 import { useEffect, useState } from 'react';
-import type { ProteinFold } from '@/lib/proteinFold';
+import type { ProteinFold } from '@/store';
 
 export function useProteinFold(sequence: string) {
   const [loading, setLoading] = useState(false);
