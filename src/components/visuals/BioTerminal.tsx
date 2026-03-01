@@ -1,8 +1,24 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
-import { motion } from 'framer-motion';
-import { Terminal, Trash2, Download } from 'lucide-react';
+/**
+ * BioTerminal.tsx — Sovereign Edition
+ * ──────────────────────────────────────────────────────────────────────────────
+ * The System Log: real-time genomic engine output stream.
+ *
+ * SOVEREIGN DESIGN MANDATES:
+ *   • All text in `var(--font-jetbrains-mono)` — zero font fallback drift.
+ *   • Abyssal background (#020617) — deeper than the Workbench chrome.
+ *   • Single accent color (#38BDF8) with level-specific semantic tones.
+ *   • Category badges as micro-typography chips (all-caps, 9px, letter-spacing).
+ *   • Log entries enter with a minimal 80ms fade-in-right — clinical, not theatrical.
+ *   • NO CRT flicker / scanlines — those were retro aesthetics, now removed.
+ *   • Glass topbar with backdrop-blur for depth without heaviness.
+ * ──────────────────────────────────────────────────────────────────────────────
+ */
+
+import { useEffect, useRef, useState, useCallback, memo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Terminal, Trash2, Download, Copy, ChevronDown, X } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { useArkheStore, type ArkheState } from '@/store';
@@ -10,256 +26,445 @@ import type { SystemLog } from '@/store/types';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));
 
-interface BioTerminalProps {
-  isCollapsed?: boolean;
-  onToggle?: () => void;
+// ─── Level color tokens ───────────────────────────────────────────────────────
+// Deliberately restrained — no neon saturation against the abyssal ground.
+const LEVEL_COLOR: Record<SystemLog['level'], string> = {
+  info:    '#94A3B8',   // slate-400
+  success: '#4ADE80',   // green-400
+  warning: '#FACC15',   // yellow-400
+  error:   '#FB7185',   // rose-400
+  debug:   '#475569',   // slate-600
+};
+
+// Ambient glow (subtle — reinforces the message weight, not the decoration)
+const LEVEL_GLOW: Record<SystemLog['level'], string> = {
+  info:    '',
+  success: 'drop-shadow-[0_0_5px_rgba(74,222,128,0.40)]',
+  warning: 'drop-shadow-[0_0_5px_rgba(250,204,21,0.35)]',
+  error:   'drop-shadow-[0_0_5px_rgba(251,113,133,0.45)]',
+  debug:   '',
+};
+
+// Level indicator dot
+const LEVEL_DOT: Record<SystemLog['level'], string> = {
+  info:    '#38BDF8',
+  success: '#4ADE80',
+  warning: '#FACC15',
+  error:   '#FB7185',
+  debug:   '#334155',
+};
+
+// ─── Category color tokens ────────────────────────────────────────────────────
+const CATEGORY_COLOR: Record<SystemLog['category'], string> = {
+  SYSTEM:   '#38BDF8',   // accent — sky-400
+  WORKER:   '#818CF8',   // indigo-400
+  MEMORY:   '#34D399',   // emerald-400
+  CHRONOS:  '#A78BFA',   // violet-400
+  SENTINEL: '#FACC15',   // yellow-400
+  ORF:      '#F472B6',   // pink-400
+  PCR:      '#4ADE80',   // green-400
+  REPORT:   '#94A3B8',   // slate-400
+};
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function formatTs(ts: number): string {
+  const d = new Date(ts);
+  return (
+    d.getHours().toString().padStart(2, '0') + ':' +
+    d.getMinutes().toString().padStart(2, '0') + ':' +
+    d.getSeconds().toString().padStart(2, '0') + '.' +
+    d.getMilliseconds().toString().padStart(3, '0')
+  );
 }
 
+// ─── LogEntry ─────────────────────────────────────────────────────────────────
+
+const LogEntry = memo(function LogEntry({
+  log,
+  index,
+}: {
+  log:   SystemLog;
+  index: number;
+}) {
+  const color    = LEVEL_COLOR[log.level]    ?? '#94A3B8';
+  const glow     = LEVEL_GLOW[log.level]     ?? '';
+  const dotColor = LEVEL_DOT[log.level]      ?? '#334155';
+  const catColor = CATEGORY_COLOR[log.category] ?? '#64748B';
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, x: -8 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={{ duration: 0.08, ease: 'easeOut' }}
+      className={cn(
+        'flex items-start gap-2 px-3 py-[3px] group',
+        'hover:bg-[rgba(255,255,255,0.025)] transition-colors duration-75 rounded-[3px]',
+      )}
+    >
+      {/* Level dot (visible on hover) */}
+      <div
+        className="w-1 h-1 rounded-full shrink-0 mt-[5px] opacity-0 group-hover:opacity-100 transition-opacity"
+        style={{ background: dotColor, boxShadow: `0 0 4px ${dotColor}80` }}
+      />
+
+      {/* Timestamp */}
+      <span
+        className="text-[10px] tabular-nums shrink-0 select-none"
+        style={{
+          color:      '#1E293B',
+          fontFamily: 'var(--font-jetbrains-mono), monospace',
+          minWidth:   '78px',
+        }}
+      >
+        {formatTs(log.timestamp ?? Date.now())}
+      </span>
+
+      {/* Category chip */}
+      <span
+        className="text-[9px] font-bold uppercase tracking-[0.10em] shrink-0 select-none"
+        style={{
+          color:      catColor,
+          fontFamily: 'var(--font-jetbrains-mono), monospace',
+          minWidth:   '60px',
+        }}
+      >
+        {log.category}
+      </span>
+
+      {/* Message */}
+      <span
+        className={cn('text-[11.5px] flex-1 leading-[1.55]', glow)}
+        style={{
+          color,
+          fontFamily: 'var(--font-jetbrains-mono), monospace',
+        }}
+      >
+        {log.message}
+      </span>
+    </motion.div>
+  );
+});
+
+// ─── Empty state ──────────────────────────────────────────────────────────────
+
+function TerminalEmpty() {
+  return (
+    <div className="flex flex-col items-center justify-center h-full pb-8 select-none">
+      <div
+        className="text-[10px] uppercase tracking-[0.14em] mb-3"
+        style={{ color: '#1E293B', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
+      >
+        ─────────────────────────────
+      </div>
+      <p
+        className="text-[11px] font-semibold uppercase tracking-[0.10em]"
+        style={{ color: '#334155', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
+      >
+        Arkhé Genesis v1.0
+      </p>
+      <p
+        className="text-[10px] mt-1.5"
+        style={{ color: '#1E293B', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
+      >
+        Terminal ready · awaiting system events…
+      </p>
+      <div
+        className="text-[10px] uppercase tracking-[0.14em] mt-3"
+        style={{ color: '#1E293B', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
+      >
+        ─────────────────────────────
+      </div>
+    </div>
+  );
+}
+
+// ─── Props ────────────────────────────────────────────────────────────────────
+
+interface BioTerminalProps {
+  isCollapsed?: boolean;
+  onToggle?:    () => void;
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
+
 export default function BioTerminal({ isCollapsed = false, onToggle }: BioTerminalProps) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const [input, setInput] = useState('');
-  const [commandHistory, setCommandHistory] = useState<string[]>([]);
-  const [historyIndex, setHistoryIndex] = useState(-1);
+  const scrollRef   = useRef<HTMLDivElement>(null);
+  const inputRef    = useRef<HTMLInputElement>(null);
+  const [input,      setInput]      = useState('');
+  const [history,    setHistory]    = useState<string[]>([]);
+  const [histIdx,    setHistIdx]    = useState(-1);
+  const [autoScroll, setAutoScroll] = useState(true);
 
-  const terminalLogs = useArkheStore((state: ArkheState) => state.terminalLogs);
-  const clearTerminalLogs = useArkheStore((state: ArkheState) => state.clearTerminalLogs);
-  const executeCommand = useArkheStore((state) => state.executeTerminalCommand);
-  const addTerminalOutput = useArkheStore((state) => state.addTerminalOutput);
+  const terminalLogs     = useArkheStore((s: ArkheState) => s.terminalLogs);
+  const clearTerminalLogs = useArkheStore((s: ArkheState) => s.clearTerminalLogs);
+  const executeCommand    = useArkheStore((s) => s.executeTerminalCommand);
 
-  // Auto‑scroll to bottom on new logs
+  // ── Auto-scroll ───────────────────────────────────────────────────────────
   useEffect(() => {
-    if (scrollRef.current) {
+    if (autoScroll && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [terminalLogs]);
+  }, [terminalLogs, autoScroll]);
 
-  const handleExport = () => {
-    const logText = terminalLogs
-      .map(log => `[${new Date(log.timestamp || Date.now()).toISOString()}] [${log.category}] ${log.level.toUpperCase()}: ${log.message}`)
+  // Detect manual scroll — disable auto-scroll
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+    setAutoScroll(atBottom);
+  }, []);
+
+  // ── Export ────────────────────────────────────────────────────────────────
+  const handleExport = useCallback(() => {
+    const text = terminalLogs
+      .map(l => `[${new Date(l.timestamp ?? Date.now()).toISOString()}] [${l.category}] ${l.level.toUpperCase()}: ${l.message}`)
       .join('\n');
-    
-    const blob = new Blob([logText], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
     a.href = url;
     a.download = `arkhe-terminal-${Date.now()}.log`;
     a.click();
     URL.revokeObjectURL(url);
-  };
+  }, [terminalLogs]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  // ── Copy all ──────────────────────────────────────────────────────────────
+  const handleCopy = useCallback(() => {
+    const text = terminalLogs.map(l => `${l.category} ${l.message}`).join('\n');
+    navigator.clipboard.writeText(text);
+  }, [terminalLogs]);
+
+  // ── Submit command ────────────────────────────────────────────────────────
+  const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim()) return;
-
-    setCommandHistory(prev => [...prev, input]);
-    setHistoryIndex(-1);
+    setHistory(prev => [...prev, input]);
+    setHistIdx(-1);
     await executeCommand(input);
     setInput('');
-  };
+    setAutoScroll(true);
+  }, [input, executeCommand]);
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  // ── History navigation ────────────────────────────────────────────────────
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'ArrowUp') {
       e.preventDefault();
-      if (commandHistory.length > 0) {
-        const newIndex = Math.min(historyIndex + 1, commandHistory.length - 1);
-        setHistoryIndex(newIndex);
-        setInput(commandHistory[commandHistory.length - 1 - newIndex]);
-      }
+      if (!history.length) return;
+      const next = Math.min(histIdx + 1, history.length - 1);
+      setHistIdx(next);
+      setInput(history[history.length - 1 - next]);
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
-      if (historyIndex > 0) {
-        const newIndex = historyIndex - 1;
-        setHistoryIndex(newIndex);
-        setInput(commandHistory[commandHistory.length - 1 - newIndex]);
-      } else if (historyIndex === 0) {
-        setHistoryIndex(-1);
+      if (histIdx > 0) {
+        const next = histIdx - 1;
+        setHistIdx(next);
+        setInput(history[history.length - 1 - next]);
+      } else {
+        setHistIdx(-1);
         setInput('');
       }
     }
-  };
+  }, [history, histIdx]);
 
-  // Safe mapping functions – now fully typed
-  const getLevelColor = (level: SystemLog['level']) => {
-    const colors: Record<SystemLog['level'], string> = {
-      info: 'text-cyan-300/80',
-      success: 'text-emerald-500/80',
-      warning: 'text-amber-400/80',
-      error: 'text-rose-500/80',
-      debug: 'text-zinc-500/80',
-    };
-    return colors[level] || 'text-zinc-400/80';
-  };
-
-  const getLevelGlow = (level: SystemLog['level']) => {
-    const glows: Record<SystemLog['level'], string> = {
-      info: 'drop-shadow-glow-cyan',
-      success: 'drop-shadow-glow-emerald',
-      warning: 'drop-shadow-glow-amber',
-      error: 'drop-shadow-glow-rose',
-      debug: '',
-    };
-    return glows[level] || '';
-  };
-
-  const getCategoryColor = (category: SystemLog['category']) => {
-    const colors: Record<SystemLog['category'], string> = {
-      SYSTEM: 'text-amber-400/90',
-      WORKER: 'text-cyan-400/90',
-      MEMORY: 'text-blue-400/90',
-      CHRONOS: 'text-purple-400/90',
-      SENTINEL: 'text-rose-400/90',
-      ORF: 'text-emerald-400/90',
-      PCR: 'text-sky-400/90',
-      REPORT: 'text-indigo-400/90',
-    };
-    return colors[category] || 'text-zinc-400/90';
-  };
+  // ── Scroll to bottom button ───────────────────────────────────────────────
+  const scrollToBottom = useCallback(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+    setAutoScroll(true);
+  }, []);
 
   return (
-    <div className={cn(
-      "w-full h-full flex flex-col bg-void-panel transition-all duration-300 relative overflow-hidden",
-      isCollapsed && "w-0"
-    )}>
-      {/* CRT Scanline Overlay */}
-      <div className="absolute inset-0 pointer-events-none z-50 crt-scanlines opacity-30" />
-      
-      {/* Subtle flicker effect */}
-      <div className="absolute inset-0 pointer-events-none z-40 crt-flicker" />
-
-      {/* Vignette overlay */}
-      <div className="absolute inset-0 pointer-events-none z-30 bg-gradient-radial from-transparent via-transparent to-void-black/40" />
-
-      {/* Header – Glassmorphism */}
-      <div className="relative z-10 h-10 border-b border-razor bg-void-surface/80 backdrop-blur-md flex items-center justify-between px-4 flex-shrink-0">
+    <div
+      className={cn(
+        'w-full h-full flex flex-col overflow-hidden relative',
+        isCollapsed && 'w-0',
+      )}
+      style={{ background: '#020617' }}
+    >
+      {/* ── Glass header ─────────────────────────────────────────────────── */}
+      <div
+        className="flex items-center justify-between px-3 flex-shrink-0"
+        style={{
+          height:       '38px',
+          background:   'rgba(13,27,46,0.85)',
+          backdropFilter: 'blur(16px)',
+          WebkitBackdropFilter: 'blur(16px)',
+          borderBottom: '1px solid rgba(255,255,255,0.07)',
+        }}
+      >
         <div className="flex items-center gap-2">
-          <Terminal className="w-4 h-4 text-cyan-400 drop-shadow-glow-cyan" />
-          <h3 className="text-sm font-medium text-primary tracking-tight">BioTerminal</h3>
-          <div className="flex items-center gap-1 ml-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse drop-shadow-glow-emerald" />
-            <span className="text-[10px] text-emerald-400/80 font-mono uppercase tracking-wider">
+          <Terminal
+            size={13}
+            style={{ color: '#38BDF8' }}
+          />
+          <span
+            className="text-[11px] font-semibold"
+            style={{ color: '#E2E8F0', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
+          >
+            BioTerminal
+          </span>
+
+          {/* Online indicator */}
+          <div className="flex items-center gap-1.5 ml-1">
+            <div
+              className="w-1.5 h-1.5 rounded-full"
+              style={{
+                background: '#4ADE80',
+                boxShadow:  '0 0 5px rgba(74,222,128,0.55)',
+                animation:  'pulse 2.5s ease-in-out infinite',
+              }}
+            />
+            <span
+              className="text-[9.5px] uppercase tracking-[0.08em]"
+              style={{ color: '#34D399', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
+            >
               Online
             </span>
           </div>
+
+          {/* Log count */}
+          {terminalLogs.length > 0 && (
+            <span
+              className="px-1.5 py-0.5 rounded-[3px] text-[9px] tabular-nums"
+              style={{
+                background: 'rgba(56,189,248,0.10)',
+                color:      '#38BDF8',
+                fontFamily: 'var(--font-jetbrains-mono), monospace',
+                border:     '1px solid rgba(56,189,248,0.20)',
+              }}
+            >
+              {terminalLogs.length}
+            </span>
+          )}
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleExport}
-            className="p-1.5 hover:bg-white/5 rounded transition-colors backdrop-blur-sm"
-            title="Export logs"
-          >
-            <Download size={14} className="text-zinc-400 hover:text-zinc-300" />
-          </button>
-          <button
-            onClick={clearTerminalLogs}
-            className="p-1.5 hover:bg-white/5 rounded transition-colors backdrop-blur-sm"
-            title="Clear terminal"
-          >
-            <Trash2 size={14} className="text-zinc-400 hover:text-zinc-300" />
-          </button>
+        {/* Actions */}
+        <div className="flex items-center gap-0.5">
+          {[
+            { icon: <Copy     size={12} />, fn: handleCopy,   title: 'Copy all' },
+            { icon: <Download size={12} />, fn: handleExport, title: 'Export log' },
+            { icon: <Trash2   size={12} />, fn: clearTerminalLogs, title: 'Clear' },
+            ...(onToggle ? [{ icon: <X size={12} />, fn: onToggle, title: 'Close' }] : []),
+          ].map((btn, i) => (
+            <button
+              key={i}
+              onClick={btn.fn}
+              title={btn.title}
+              className="p-1.5 rounded transition-colors text-[#334155] hover:text-[#64748B] hover:bg-[rgba(255,255,255,0.05)]"
+            >
+              {btn.icon}
+            </button>
+          ))}
         </div>
       </div>
 
-      {/* Terminal output – CRT monitor effect */}
+      {/* ── Log output ───────────────────────────────────────────────────── */}
       <div
         ref={scrollRef}
-        className="relative z-10 flex-1 overflow-y-auto p-4 font-mono text-xs space-y-0.5 bg-gradient-to-b from-void/95 to-void-black/95 backdrop-blur-sm"
-        style={{
-          textShadow: '0 0 4px currentColor',
-        }}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto py-2 min-h-0"
+        style={{ background: '#020617' }}
+        onClick={() => inputRef.current?.focus()}
       >
         {terminalLogs.length === 0 ? (
-          <div className="text-zinc-600 text-center py-8 animate-pulse">
-            <div className="text-cyan-400/60 mb-2">⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯</div>
-            <div>ARKHÉ GENESIS v1.0</div>
-            <div className="text-[10px] mt-1">Terminal ready. Awaiting system events...</div>
-            <div className="text-cyan-400/60 mt-2">⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯</div>
-          </div>
+          <TerminalEmpty />
         ) : (
-          terminalLogs.map((log, index) => (
-            <motion.div
-              key={`${log.timestamp}-${index}`}
-              initial={{ opacity: 0, x: -10 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ 
-                duration: 0.15,
-                ease: "easeOut"
-              }}
-              className="flex items-start gap-2 hover:bg-white/[0.02] px-2 py-0.5 rounded group"
-            >
-              {/* Timestamp with glow */}
-              <span className="text-zinc-600 text-[10px] w-20 flex-shrink-0 tracking-tighter font-mono">
-                {new Date(log.timestamp || Date.now()).toLocaleTimeString()}
-              </span>
-
-              {/* Category badge */}
-              <span className={cn(
-                "text-[9px] uppercase tracking-wider font-black w-20 flex-shrink-0",
-                getCategoryColor(log.category)
-              )}>
-                [{log.category}]
-              </span>
-
-              {/* Message with level‑based glow */}
-              <span className={cn(
-                "flex-1 leading-relaxed",
-                getLevelColor(log.level),
-                getLevelGlow(log.level)
-              )}>
-                {log.message}
-              </span>
-
-              {/* Level indicator dot */}
-              <div className={cn(
-                "w-1 h-1 rounded-full flex-shrink-0 mt-1.5 opacity-0 group-hover:opacity-100 transition-opacity",
-                log.level === 'info' && "bg-cyan-400 shadow-glow-cyan",
-                log.level === 'success' && "bg-emerald-500 shadow-glow-emerald",
-                log.level === 'warning' && "bg-amber-400 shadow-glow-amber",
-                log.level === 'error' && "bg-rose-500 shadow-glow-rose",
-                log.level === 'debug' && "bg-zinc-500"
-              )} />
-            </motion.div>
+          terminalLogs.map((log, i) => (
+            <LogEntry key={`${log.timestamp}-${i}`} log={log} index={i} />
           ))
         )}
       </div>
 
-      {/* Command Input */}
-      <div className="relative z-10 border-t border-razor bg-void-surface/80 backdrop-blur-md p-3 flex-shrink-0">
-        <form onSubmit={handleSubmit} className="flex items-center gap-2">
-          <span className="text-cyan-400 text-xs font-mono drop-shadow-glow-cyan">$</span>
-          <input
-            ref={inputRef}
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Enter command..."
-            className="flex-1 bg-transparent text-xs font-mono text-cyan-300 placeholder:text-zinc-700 outline-none caret-cyan-400"
+      {/* ── Scroll-to-bottom button ───────────────────────────────────────── */}
+      <AnimatePresence>
+        {!autoScroll && (
+          <motion.button
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 6 }}
+            onClick={scrollToBottom}
+            className="absolute bottom-14 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full transition-all"
             style={{
-              textShadow: '0 0 4px currentColor',
+              background:  'rgba(56,189,248,0.15)',
+              border:      '1px solid rgba(56,189,248,0.30)',
+              backdropFilter: 'blur(8px)',
+              boxShadow:   '0 0 12px rgba(56,189,248,0.12)',
             }}
-          />
-          <div className="text-[10px] text-zinc-700 font-mono">
-            {commandHistory.length > 0 && `↑↓ ${commandHistory.length} cmd`}
-          </div>
-        </form>
-      </div>
+          >
+            <ChevronDown size={11} style={{ color: '#38BDF8' }} />
+            <span
+              className="text-[10px]"
+              style={{ color: '#38BDF8', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
+            >
+              scroll to bottom
+            </span>
+          </motion.button>
+        )}
+      </AnimatePresence>
 
-      {/* Scan line animation – horizontal sweep */}
-      <div className="absolute inset-0 pointer-events-none z-20 overflow-hidden">
-        <motion.div
-          className="w-full h-px bg-gradient-to-r from-transparent via-cyan-400/20 to-transparent"
-          animate={{
-            y: [0, 600, 0],
+      {/* ── Command input ─────────────────────────────────────────────────── */}
+      <form
+        onSubmit={handleSubmit}
+        className="flex items-center gap-2 px-3 py-2 flex-shrink-0"
+        style={{
+          background:  'rgba(13,27,46,0.80)',
+          borderTop:   '1px solid rgba(255,255,255,0.06)',
+          backdropFilter: 'blur(12px)',
+        }}
+      >
+        {/* Prompt sigil */}
+        <span
+          className="text-[13px] shrink-0 select-none"
+          style={{
+            color:      '#38BDF8',
+            fontFamily: 'var(--font-jetbrains-mono), monospace',
           }}
-          transition={{
-            duration: 4,
-            repeat: Infinity,
-            ease: "linear",
+        >
+          ❯
+        </span>
+
+        {/* Input field */}
+        <input
+          ref={inputRef}
+          type="text"
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Enter command…"
+          autoComplete="off"
+          spellCheck={false}
+          className="flex-1 bg-transparent outline-none placeholder:text-[#1E293B]"
+          style={{
+            color:       '#94A3B8',
+            fontFamily:  'var(--font-jetbrains-mono), monospace',
+            fontSize:    '12px',
+            caretColor:  '#38BDF8',
           }}
         />
-      </div>
+
+        {/* History hint */}
+        {history.length > 0 && (
+          <span
+            className="text-[9.5px] tabular-nums shrink-0 select-none"
+            style={{ color: '#1E293B', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
+          >
+            ↑↓ {history.length}
+          </span>
+        )}
+
+        {/* Blinking cursor decoration */}
+        <span
+          className="text-[12px] shrink-0 select-none"
+          style={{
+            color:       '#38BDF8',
+            fontFamily:  'var(--font-jetbrains-mono), monospace',
+            animation:   'terminal-cursor 1.1s step-end infinite',
+            opacity:     input ? 0 : 1,
+          }}
+        >
+          ▌
+        </span>
+      </form>
     </div>
   );
 }

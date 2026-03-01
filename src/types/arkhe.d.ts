@@ -104,14 +104,7 @@ export interface ORF {
 }
 
 // -------------------- Chronos --------------------
-export interface TransactionSummary {
-  txId: string;
-  parentTxId: string | null;
-  timestamp: number;
-  author?: string;
-  commitMessage?: string;
-  mutationCount: number;
-}
+// TransactionSummary moved to src/store/types.ts for type unification
 
 export interface Commit {
   txId: string;
@@ -372,4 +365,16 @@ export interface SystemLog {
   category: string;
   message: string;
   level: 'info' | 'success' | 'warning' | 'error';
+}
+
+/**
+ * Summary of a transaction (commit) for history views.
+ */
+export interface TransactionSummary {
+  txId: string;
+  parentTxId: string | null;
+  timestamp: number;
+  author?: string;
+  commitMessage?: string;
+  mutationCount: number;
 }

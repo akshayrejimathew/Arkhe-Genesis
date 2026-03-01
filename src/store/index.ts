@@ -54,6 +54,13 @@
  *
  * This matches the original monolithic export surface exactly so no component
  * imports break during the refactor.
+ *
+ * ── MX-01 NOTE ───────────────────────────────────────────────────────────────
+ *
+ * `actionQueue` is a non-serialisable Promise<void>.  It is intentionally
+ * excluded from the selector surface — components should never read it
+ * directly.  Use `useIsLocked` to detect whether an atomic action is in
+ * flight and conditionally render a loading / disabled state.
  */
 
 import { create } from 'zustand';
@@ -109,6 +116,10 @@ export const useViewportTranslations = () =>
 /** GC percentage of the current viewport window. */
 export const useViewportGC = () =>
   useArkheStore((s) => s.viewport.gcPercent);
+
+/** LB-11/14: Viewport version counter for React Concurrent mode safety. */
+export const useViewportVersion = () =>
+  useArkheStore((s) => s.viewportVersion);
 
 /**
  * Feature tags visible in the current viewport window.
@@ -239,6 +250,31 @@ export const useCurrentBranch = () =>
 
 export const useCommits = () =>
   useArkheStore((s) => s.commits);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § Selectors — Async Mutex (MX-01)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * useIsLocked
+ *
+ * Returns `true` while any atomic chronos action (undo, redo,
+ * applyLocalMutation) is executing inside the sequential execution queue.
+ *
+ * Usage:
+ *
+ *   const isLocked = useIsLocked();
+ *
+ *   <button disabled={isLocked} onClick={undo}>
+ *     {isLocked ? <Spinner /> : 'Undo'}
+ *   </button>
+ *
+ * This selector is the ONLY intended way to observe the mutex state from
+ * React components.  Do NOT read `actionQueue` from the store — it is a
+ * non-serialisable Promise and is not stable across renders.
+ */
+export const useIsLocked = () =>
+  useArkheStore((s) => s.isLocked);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § Selectors — Surgical Commit

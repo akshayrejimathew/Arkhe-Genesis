@@ -1,11 +1,11 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { 
-  Search, 
-  Settings, 
-  HelpCircle, 
+import {
+  Search,
+  Settings,
+  HelpCircle,
   Keyboard,
   CreditCard,
   User,
@@ -16,6 +16,8 @@ import {
   Terminal,
   Command,
 } from 'lucide-react';
+import { useArkheStore } from '@/store';
+import { supabase } from '@/lib/supabase';
 
 interface CommandPaletteProps {
   isOpen: boolean;
@@ -24,24 +26,36 @@ interface CommandPaletteProps {
 
 /**
  * COMMAND PALETTE - Ctrl+K Interface
- * Professional command palette for quick actions and settings
+ * Phase 6: handleCommandSelect is now wired to the Zustand store and Supabase auth.
+ *
+ *   terminal  → executeTerminalCommand('help')
+ *   explorer  → no-op nav hint (expand left sidebar is driven by Workbench parent state;
+ *               here we fire a custom event so Workbench can listen if desired)
+ *   database  → opens the database panel (custom event)
+ *   sentinel  → opens the sentinel panel (custom event)
+ *   logout    → supabase.auth.signOut() then redirect to /login
+ *   others    → logged via addSystemLog so they appear in the terminal
  */
 export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps) {
-  const [query, setQuery] = useState('');
+  const [query,    setQuery]    = useState('');
   const [selected, setSelected] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  // ── Store actions ───────────────────────────────────────────────────────────
+  const executeTerminalCommand = useArkheStore.getState().executeTerminalCommand;
+  const addSystemLog           = useArkheStore.getState().addSystemLog;
+
   const commands = [
-    { id: 'settings', icon: Settings, label: 'Settings', shortcut: '⌘,' },
-    { id: 'help', icon: HelpCircle, label: 'Help & Documentation', shortcut: '?' },
-    { id: 'shortcuts', icon: Keyboard, label: 'Keyboard Shortcuts', shortcut: '⌘K' },
-    { id: 'billing', icon: CreditCard, label: 'Subscription & Billing', shortcut: null },
-    { id: 'profile', icon: User, label: 'Profile Settings', shortcut: null },
-    { id: 'terminal', icon: Terminal, label: 'Open Terminal', shortcut: '⌘T' },
-    { id: 'explorer', icon: FileText, label: 'Toggle Explorer', shortcut: '⌘E' },
-    { id: 'database', icon: Database, label: 'Database Connections', shortcut: '⌘D' },
-    { id: 'sentinel', icon: Shield, label: 'Security Scan', shortcut: '⌘S' },
-    { id: 'logout', icon: LogOut, label: 'Sign Out', shortcut: null },
+    { id: 'settings',  icon: Settings,  label: 'Settings',               shortcut: '⌘,' },
+    { id: 'help',      icon: HelpCircle, label: 'Help & Documentation',    shortcut: '?' },
+    { id: 'shortcuts', icon: Keyboard,  label: 'Keyboard Shortcuts',      shortcut: '⌘K' },
+    { id: 'billing',   icon: CreditCard, label: 'Subscription & Billing',  shortcut: null },
+    { id: 'profile',   icon: User,       label: 'Profile Settings',        shortcut: null },
+    { id: 'terminal',  icon: Terminal,   label: 'Open Terminal',           shortcut: '⌘T' },
+    { id: 'explorer',  icon: FileText,   label: 'Toggle Explorer',         shortcut: '⌘E' },
+    { id: 'database',  icon: Database,   label: 'Database Connections',    shortcut: '⌘D' },
+    { id: 'sentinel',  icon: Shield,     label: 'Security Scan',           shortcut: '⌘S' },
+    { id: 'logout',    icon: LogOut,     label: 'Sign Out',                shortcut: null },
   ];
 
   const filteredCommands = commands.filter(cmd =>
@@ -53,6 +67,69 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
       inputRef.current.focus();
     }
   }, [isOpen]);
+
+  // ── Command dispatch ────────────────────────────────────────────────────────
+  const handleCommandSelect = useCallback((commandId: string) => {
+    onClose();
+
+    switch (commandId) {
+      // ── Terminal: print the help tree ──────────────────────────────────────
+      case 'terminal':
+        executeTerminalCommand('help').catch((err: unknown) => {
+          console.error('[CommandPalette] terminal command failed:', err);
+        });
+        break;
+
+      // ── Sign out ───────────────────────────────────────────────────────────
+      case 'logout':
+        supabase.auth.signOut().finally(() => {
+          window.location.href = '/login';
+        });
+        break;
+
+      // ── Panel navigation — dispatch a custom DOM event that Workbench or   ─
+      // ── any subscriber can intercept to update left-panel state.           ─
+      case 'explorer':
+        window.dispatchEvent(new CustomEvent('arkhe:openPanel', { detail: { panel: 'explorer' } }));
+        addSystemLog({
+          level: 'info',
+          category: 'SYSTEM' as any,
+          message: 'Explorer panel activated.',
+          timestamp: Date.now(),
+        });
+        break;
+
+      case 'database':
+        window.dispatchEvent(new CustomEvent('arkhe:openPanel', { detail: { panel: 'database' } }));
+        addSystemLog({
+          level: 'info',
+          category: 'SYSTEM' as any,
+          message: 'Database panel activated.',
+          timestamp: Date.now(),
+        });
+        break;
+
+      case 'sentinel':
+        window.dispatchEvent(new CustomEvent('arkhe:openPanel', { detail: { panel: 'sentinel' } }));
+        addSystemLog({
+          level: 'info',
+          category: 'SENTINEL' as any,
+          message: 'Sentinel security scan panel opened.',
+          timestamp: Date.now(),
+        });
+        break;
+
+      // ── Remaining commands: log so they surface in the terminal  ───────────
+      default:
+        addSystemLog({
+          level: 'info',
+          category: 'SYSTEM' as any,
+          message: `Command palette: "${commandId}" selected.`,
+          timestamp: Date.now(),
+        });
+        break;
+    }
+  }, [onClose, executeTerminalCommand, addSystemLog]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -82,13 +159,7 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, selected, filteredCommands]);
-
-  const handleCommandSelect = (commandId: string) => {
-    console.log('Command selected:', commandId);
-    // Implement command actions here
-    onClose();
-  };
+  }, [isOpen, selected, filteredCommands, handleCommandSelect]);
 
   return (
     <AnimatePresence>
@@ -152,8 +223,8 @@ export default function CommandPalette({ isOpen, onClose }: CommandPaletteProps)
                         className={`
                           w-full flex items-center justify-between px-3 py-2.5 rounded-md
                           transition-colors text-left
-                          ${isSelected 
-                            ? 'bg-white/5 text-white' 
+                          ${isSelected
+                            ? 'bg-white/5 text-white'
                             : 'text-zinc-400 hover:text-zinc-300 hover:bg-white/[0.02]'
                           }
                         `}

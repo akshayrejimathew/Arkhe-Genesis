@@ -16,39 +16,67 @@
  *   • Diff mode         (setComparisonSequence, toggleDiffMode)
  *   • Internal setters  (updateSlabMeta, addEditedSlab, setViewportData, …)
  *
+ * ── NEW FIX (FR-01) — Frozen Recovery: COMMIT_SYNC Slab Verification ─────────
+ *
+ *   PROBLEM:
+ *     When a cloud sync completes (COMMIT_SYNC), the Zustand store's
+ *     `chronosHead` and the Supabase branches agree on the authoritative HEAD
+ *     commit. However the worker's SlabManager may hold dirty physical bytes
+ *     from local mutations that were never synced — or a race between an
+ *     in-flight undo and the COMMIT_SYNC push may have left the slabs at a
+ *     stale txId. The UI renders data from the slabs, not from Supabase, so
+ *     the user sees incorrect sequence even though the cloud is correct.
+ *
+ *   FIX — THREE-PHASE RECOVERY:
+ *
+ *     Phase 1 — Verification (fire-and-forget after sync success):
+ *       After a successful cloud sync we immediately call
+ *       `postAndWait(worker, 'VERIFY_SLAB_STATE', { expectedTxId })`.
+ *       The worker calls `slabManager.revertToSnapshot(expectedTxId)` and
+ *       replies with `{ status, slabVersion }`.
+ *
+ *     Phase 2 — Detection:
+ *       If status === 'hard_reset_required', the worker's SlabManager has
+ *       already wiped all slab allocations and incremented its internal
+ *       slabVersion. We mirror that in the Zustand store:
+ *         set({ isRealigning: true, slabVersion: newSlabVersion })
+ *
+ *     Phase 3 — Recovery:
+ *       We call `loadGenomeFromCloud(activeGenomeId)`, which re-downloads the
+ *       FASTA, re-streams it to the worker, and replays the full Chronos
+ *       history. When complete we set `isRealigning: false` and the
+ *       `setViewportData` call inside requestViewport bumps
+ *       `slabAcknowledgedVersion` to match `slabVersion`, clearing the
+ *       SequenceView guard overlay.
+ *
+ *   TYPES.TS NOTE:
+ *     This fix adds three fields to GenomeState. Update
+ *     src/store/types.ts > GenomeState with:
+ *
+ *       isRealigning: boolean;
+ *       slabVersion: number;
+ *       slabAcknowledgedVersion: number;
+ *
+ *     And to GenomeActions:
+ *       setIsRealigning: (realigning: boolean) => void;
+ *
+ * ── PREVIOUS FIXES (2026-02-25) ──────────────────────────────────────────────
+ *
+ *   LB-04 — Zombie `chronosHead` in COMMIT_SYNC: 3-tier branch fallback.
+ *   LB-09 — Direct state mutation in `loadFile`: fresh Map/Set via set().
+ *   LB-10 — Meaningless type cast in CHRONOS_HISTORY: TransactionSummary[].
+ *   LB-11 / LB-14 — Ghost Data & Detached ArrayBuffers: viewportVersion.
+ *   TS COMPILER FIX — StoreMutators inlined as middleware tuple.
+ *
  * ── FIXES PRESERVED ──────────────────────────────────────────────────────────
  *
- *   AUDIT III FIX 1 — STREAM_END truncation (Vector D):
- *     loadFile() and loadGenomeFromCloud() both send STREAM_END after the
- *     chunk loop so the worker can flush its partial staging buffer before
- *     fetchGenomeMetadata() is called.
- *
- *   AUDIT III FIX 2 — Worker crash = permanent silent freeze (SHADOW-01):
- *     initWorker() registers worker.onerror and worker.onmessageerror so
- *     crashed workers surface workerConnected: false + a readable workerError.
- *
- *   SPRINT 5 FIX 2 — loadGenomeFromCloud teardown safety:
- *     The streaming loop is wrapped in try/finally so STREAM_END and
- *     isSyncing reset are guaranteed even on network failure.
- *
- *   SPRINT 5 FIX 5 — Adaptive slab sizing:
- *     file.size is forwarded to RESET_ENGINE so the worker can choose an
- *     optimal slab size for the incoming genome.
- *
- *   SPRINT 5 FIX 3 — chronosHead UI desync:
- *     The COMMIT_SYNC branch-update path (inside the worker message listener)
- *     derives the new chronosHead from the updated branch list.  This listener
- *     lives in initWorker() where it has full access to the combined ArkheState
- *     via get().
- *
- *   SPRINT 5 FIX 4 — TypeScript implicit any:
- *     The COMMIT_SYNC payload is explicitly typed so the .find() callback is
- *     not implicitly any-typed.
- *
- *   CF-04 — Chronos Viewport Sync:
- *     undo() / redo() live in chronosSlice.ts but both call requestViewport
- *     (owned here) after postAndWait resolves.  The action signature is on
- *     ArkheState so the chronos slice can cross-call without circular imports.
+ *   AUDIT III FIX 1 — STREAM_END truncation (Vector D).
+ *   AUDIT III FIX 2 — Worker crash = permanent silent freeze (SHADOW-01).
+ *   SPRINT 5 FIX 2 — loadGenomeFromCloud teardown safety.
+ *   SPRINT 5 FIX 3 — chronosHead UI desync (COMMIT_SYNC derivation).
+ *   SPRINT 5 FIX 4 — TypeScript implicit any in COMMIT_SYNC.
+ *   SPRINT 5 FIX 5 — Adaptive slab sizing.
+ *   CF-04 — Chronos Viewport Sync (undo/redo requestViewport call).
  */
 
 import type { StateCreator } from 'zustand';
@@ -63,7 +91,6 @@ import {
 } from './utils';
 import type {
   ArkheState,
-  StoreMutators,
   GenomeSlice,
   Viewport,
   SliceResponse,
@@ -82,6 +109,7 @@ import type {
   Commit,
   ORF,
   PublicGenome,
+  TransactionSummary,
 } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +118,26 @@ import type {
 
 /** Chunk size for the worker streaming protocol (64 KiB). */
 const STREAM_CHUNK_SIZE = 64 * 1_024;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FR-01: VERIFY_SLAB_STATE response type
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Response payload returned by the worker for a VERIFY_SLAB_STATE message.
+ * The worker calls slabManager.revertToSnapshot(expectedTxId) and returns
+ * the result together with the (potentially updated) slabVersion.
+ */
+interface VerifySlabStateResponse {
+  /** Whether the slabs matched the expected txId, or were hard-reset. */
+  status: 'ok' | 'hard_reset_required';
+  /**
+   * The worker's slabVersion after the check. If status === 'ok' this equals
+   * the existing slabVersion. If status === 'hard_reset_required' this is the
+   * post-hardReset slabVersion (incremented by 1).
+   */
+  slabVersion: number;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Initial genome state
@@ -107,6 +155,8 @@ const initialGenomeState = {
   editedSlabs: new Set<number>(),
 
   viewport: { start: 0, end: 1_000, buffer: new Uint8Array(1_000).buffer } as Viewport,
+  // LB-11/14: Added viewportVersion field
+  viewportVersion: 0,
   viewportData: null,
   currentSlice: 0,
   isInitialized: false,
@@ -137,6 +187,28 @@ const initialGenomeState = {
 
   orfScanResult: null,
   isORFScanning: false,
+
+  // ── FR-01: Frozen Recovery state fields ─────────────────────────────────────
+  //
+  // isRealigning         — true while a slab-cloud mismatch has been detected
+  //                        and the genome is being re-loaded from cloud storage.
+  //                        SequenceView shows the "Re-aligning Memory..." overlay
+  //                        whenever this is true OR slabVersion !== slabAcknowledgedVersion.
+  //
+  // slabVersion          — mirrors SlabManager.slabVersion. Incremented by 1
+  //                        each time the worker's SlabManager.hardReset() fires.
+  //                        Starts at 0 (no hard reset has ever occurred).
+  //
+  // slabAcknowledgedVersion — the slabVersion that was current the last time
+  //                        setViewportData() successfully committed a fresh
+  //                        viewport to the store. When this matches slabVersion
+  //                        the UI is displaying data from the correct slab state.
+  //                        Diverges from slabVersion in the window between a
+  //                        hard reset and the first successful viewport refresh.
+  //
+  isRealigning: false,
+  slabVersion: 0,
+  slabAcknowledgedVersion: 0,
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,17 +216,15 @@ const initialGenomeState = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Creates the genome slice.
- *
- * The first generic param is ArkheState so get() returns the full combined
- * store and cross-slice calls (e.g. get().addSystemLog()) are type-safe.
- *
- * StoreMutators encodes the subscribeWithSelector middleware applied in
- * index.ts; without it Zustand's type system rejects subscribeWithSelector.
+ * TS COMPILER FIX:
+ * `StoreMutators` type alias removed — the middleware tuple is inlined directly.
+ * This avoids the cascade of "type used as value" errors that occur when
+ * StoreMutators cannot be resolved from ./types in this file's module scope.
+ * The alias remains valid in src/store/index.ts where it is actually applied.
  */
 export const createGenomeSlice: StateCreator<
   ArkheState,
-  StoreMutators,
+  [['zustand/subscribeWithSelector', never]],
   [],
   GenomeSlice
 > = (set, get) => ({
@@ -177,13 +247,20 @@ export const createGenomeSlice: StateCreator<
    * readable workerError message instead of silently freezing the UI.
    *
    * ── SPRINT 5 FIX 3 (chronosHead UI desync) ────────────────────────────────
-   * The COMMIT_SYNC handler derives chronosHead from the incoming branch list
-   * so the UI stays in sync without a separate round-trip.
+   * The COMMIT_SYNC handler derives chronosHead from the incoming branch list.
    *
    * ── SPRINT 5 FIX 4 (TypeScript implicit any) ──────────────────────────────
-   * The COMMIT_SYNC destructured payload is explicitly typed as
-   * { commits?: Commit[]; newCommits?: Commit[]; branches?: Branch[] }
-   * so the .find() callback is not implicitly any-typed.
+   * The COMMIT_SYNC destructured payload is explicitly typed.
+   *
+   * ── LB-04 FIX (Zombie chronosHead) ────────────────────────────────────────
+   * COMMIT_SYNC uses a 3-tier branch fallback. See inline comments.
+   *
+   * ── LB-10 FIX (Meaningless cast in CHRONOS_HISTORY) ──────────────────────
+   * `payload as Parameters<typeof get>` → `payload as TransactionSummary[]`.
+   *
+   * ── FR-01 FIX (Frozen Recovery) ──────────────────────────────────────────
+   * COMMIT_SYNC now fires VERIFY_SLAB_STATE after a successful cloud sync.
+   * See inline comments at the verification site.
    */
   initWorker: async () => {
     if (typeof Worker === 'undefined') {
@@ -197,13 +274,15 @@ export const createGenomeSlice: StateCreator<
         { type: 'module' },
       );
 
-      // ── FIX 2 — crash surface ─────────────────────────────────────────────
+      // ── AUDIT III FIX 2 — crash surface ───────────────────────────────────
       worker.onerror = (event: ErrorEvent) => {
-        const message = event.message || 'Worker encountered an unhandled error.';
-        console.error('[ArkheEngine] worker.onerror:', message, event);
+        const rawMessage = event.message || 'Worker encountered an unhandled error.';
+        // Strip out any continuous strings of ACGT/N characters longer than 20 bases
+        const sanitizedMessage = rawMessage.replace(/[ACGTN]{21,}/g, '[REDACTED_SEQUENCE]');
+        console.error('[ArkheEngine] worker.onerror:', sanitizedMessage, event);
         set({
           workerConnected: false,
-          workerError: `Engine crashed: ${message}. Click Reconnect to restart.`,
+          workerError: `Engine crashed: ${sanitizedMessage}. Click Reconnect to restart.`,
         });
       };
 
@@ -217,7 +296,6 @@ export const createGenomeSlice: StateCreator<
       };
 
       // ── Push-notification handler ─────────────────────────────────────────
-      // Handles unsolicited messages from the worker (not request/reply pairs).
       worker.addEventListener('message', (e: MessageEvent) => {
         const { type, payload } = e.data as { type: string; payload: unknown };
 
@@ -235,8 +313,18 @@ export const createGenomeSlice: StateCreator<
           }
 
           // ── Chronos history (full list push) ────────────────────────────
+          //
+          // ── LB-10 FIX ───────────────────────────────────────────────────
+          // OLD: `payload as Parameters<typeof get>`
+          //   Parameters<typeof get> = [] (zero-arg tuple). TypeScript accepted
+          //   `unknown as []` silently but it conveys no type information and
+          //   passing [] to setChronosTransactions is wrong at runtime.
+          //
+          // NEW: `payload as TransactionSummary[]`
+          //   Correctly types the worker's CHRONOS_HISTORY push payload and
+          //   makes the handoff to setChronosTransactions type-safe.
           case 'CHRONOS_HISTORY':
-            get().setChronosTransactions(payload as Parameters<typeof get>);
+            get().setChronosTransactions(payload as TransactionSummary[]);
             break;
 
           // ── Slab metadata update ────────────────────────────────────────
@@ -262,8 +350,7 @@ export const createGenomeSlice: StateCreator<
           // ── Off-target result ───────────────────────────────────────────
           case 'OFF_TARGET_RESULT':
             set({
-              offTargetResult:
-                payload as ArkheState['offTargetResult'],
+              offTargetResult: payload as ArkheState['offTargetResult'],
               isScanningOffTarget: false,
             });
             break;
@@ -295,23 +382,34 @@ export const createGenomeSlice: StateCreator<
             };
             get().addSystemLog({
               timestamp: log.timestamp,
-              category: log.category as 'SYSTEM' | 'WORKER' | 'MEMORY' | 'CHRONOS' | 'SENTINEL' | 'ORF' | 'PCR' | 'REPORT',
-              message: log.message,
-              level: log.level as 'info' | 'success' | 'warning' | 'error' | 'debug',
+              category : log.category as 'SYSTEM' | 'WORKER' | 'MEMORY' | 'CHRONOS' | 'SENTINEL' | 'ORF' | 'PCR' | 'REPORT',
+              message  : log.message,
+              level    : log.level as 'info' | 'success' | 'warning' | 'error' | 'debug',
             });
             break;
           }
 
           // ── COMMIT_SYNC ─────────────────────────────────────────────────
           //
-          // FIX 3 (chronosHead desync): derive new head from branch list.
-          // FIX 4 (implicit any):       payload explicitly typed below.
+          // ── LB-04 FIX (Zombie chronosHead) ────────────────────────────
+          // OLD fallback: `?? state.chronosHead`
+          //   If `currentBranch` is absent from `newBranches` (e.g. after a
+          //   branch rename, deletion, or partial push), `find()` returns
+          //   undefined and the nullish coalescing silently kept the old head.
+          //   This meant the UI's active-commit badge was frozen at a commit
+          //   ID that may already be pruned from the DAG.
+          //
+          // NEW — 3-tier fallback (documented on each tier below):
+          //
+          // ── FR-01 FIX (Frozen Recovery) ───────────────────────────────
+          // After the cloud sync succeeds we fire VERIFY_SLAB_STATE.
+          // See "Phase 1 — Verification" comment below.
           case 'COMMIT_SYNC': {
-            // Explicit type — no implicit any in .find() below.
+            // Explicit type — no implicit any in .find() (SPRINT 5 FIX 4).
             const {
-              commits: fullCommits,
+              commits  : fullCommits,
               newCommits,
-              branches: newBranches,
+              branches : newBranches,
             } = payload as {
               commits?: Commit[];
               newCommits?: Commit[];
@@ -336,31 +434,45 @@ export const createGenomeSlice: StateCreator<
               });
             }
 
-            // ── Update branch state + chronosHead (FIX 3) ─────────────────
+            // ── Update branch state + chronosHead (LB-04 fixed) ───────────
             if (newBranches) {
               set((state) => {
-                // Explicitly typed so TypeScript doesn't infer b as any.
+                // ── Tier 1: branch matching the researcher's active branch ──
+                const currentBranchHead = newBranches.find(
+                  (b: Branch) => b.name === state.currentBranch,
+                )?.headCommitId;
+
+                // ── Tier 2: fall back to `main` branch ────────────────────
+                const mainBranchHead = newBranches.find(
+                  (b: Branch) => b.name === 'main',
+                )?.headCommitId;
+
+                // ── Tier 3: first available branch ────────────────────────
+                const firstBranchHead = newBranches[0]?.headCommitId;
+
+                // ── Tier 4: retain stale head only when newBranches is empty ─
                 const newHead: string | null =
-                  newBranches.find(
-                    (b: Branch) => b.name === state.currentBranch,
-                  )?.headCommitId ?? state.chronosHead;
+                  currentBranchHead ??
+                  mainBranchHead    ??
+                  firstBranchHead   ??
+                  state.chronosHead;
 
                 return {
-                  branches: newBranches,
+                  branches   : newBranches,
                   chronosHead: newHead,
                 };
               });
             }
 
-            // ── Gate 1: unauthenticated / guest ───────────────────────────
+            // ── Gate 1: unauthenticated / guest ─────────────────────────--
             if (!user) break;
 
-            // ── Gate 2: circuit breaker tripped ───────────────────────────
+            // ── Gate 2: circuit breaker tripped ─────────────────────────--
             if (isOfflineMode) {
               get().addSystemLog({
                 timestamp: Date.now(),
-                category: 'SYSTEM',
-                message:
+                category : 'SYSTEM',
+                message  :
                   '☁️ Cloud Sync Paused — genome data is safe locally. ' +
                   (get().offlineModeReason ?? ''),
                 level: 'warning',
@@ -377,24 +489,183 @@ export const createGenomeSlice: StateCreator<
               )
                 .then((response) => {
                   if (response.status === 'offline') return;
+
                   if (response.status === 'fail') {
                     console.error('Sync failed:', response.error);
                     get().addSystemLog({
                       timestamp: Date.now(),
-                      category: 'SYSTEM',
-                      message: `❌ Cloud sync failed: ${response.error}`,
-                      level: 'error',
+                      category : 'SYSTEM',
+                      message  : `❌ Cloud sync failed: ${response.error}`,
+                      level    : 'error',
                     });
-                  } else {
-                    const count =
-                      (newCommits ?? fullCommits)?.length ?? 0;
-                    get().addSystemLog({
-                      timestamp: Date.now(),
-                      category: 'SYSTEM',
-                      message: `✅ Synced ${count} commits, ${newBranches?.length ?? 0} branches`,
-                      level: 'success',
-                    });
+                    // A failed sync means the cloud state is uncertain.
+                    // Do NOT fire VERIFY_SLAB_STATE — we have no authoritative
+                    // expected txId to verify against. The next successful sync
+                    // will trigger verification.
+                    return;
                   }
+
+                  // ── Sync success log ────────────────────────────────────
+                  const count = (newCommits ?? fullCommits)?.length ?? 0;
+                  get().addSystemLog({
+                    timestamp: Date.now(),
+                    category : 'SYSTEM',
+                    message  : `✅ Synced ${count} commits, ${newBranches?.length ?? 0} branches`,
+                    level    : 'success',
+                  });
+
+                  // ── FR-01 Phase 1 — Verify slab state ──────────────────
+                  //
+                  // RATIONALE:
+                  //   The cloud sync just confirmed the authoritative HEAD
+                  //   commit for this genome. We now verify that the worker's
+                  //   SlabManager physically reflects that same commit. If it
+                  //   doesn't (local dirty mutations, undo/redo race, or any
+                  //   other split-brain condition), the worker will hard-reset
+                  //   its slabs and signal us to trigger a full re-load.
+                  //
+                  // EXPECTED TxId RESOLUTION:
+                  //   We read chronosHead from the store state that was just
+                  //   updated in the COMMIT_SYNC block above. The 3-tier
+                  //   fallback guarantees this is non-null when any branch
+                  //   data was present in the push.
+                  const { worker: currentWorker, chronosHead } = get();
+
+                  // Guard: no worker or no known head → nothing to verify.
+                  if (!currentWorker || !chronosHead) return;
+
+                  // Guard: already in the middle of a realignment — do not
+                  // stack another verification on top of an in-flight reload.
+                  if (get().isRealigning) return;
+
+                  postAndWait<VerifySlabStateResponse>(
+                    currentWorker,
+                    'VERIFY_SLAB_STATE',
+                    { expectedTxId: chronosHead },
+                  )
+                    .then((verifyResult) => {
+                      if (verifyResult.status === 'ok') {
+                        // ── Happy path: slabs consistent with cloud ────────
+                        // Keep slabAcknowledgedVersion in sync with the
+                        // worker's slabVersion in case it diverged.
+                        set((state) => {
+                          if (state.slabVersion !== verifyResult.slabVersion) {
+                            return {
+                              slabVersion           : verifyResult.slabVersion,
+                              slabAcknowledgedVersion: verifyResult.slabVersion,
+                            };
+                          }
+                          return {};
+                        });
+                        return;
+                      }
+
+                      // ── FR-01 Phase 2 — Mismatch detected ─────────────────
+                      //
+                      // The worker has already called hardReset() and returned
+                      // the new slabVersion. We must mirror this in the store
+                      // immediately so SequenceView's guard activates.
+                      //
+                      // isRealigning: true     → shows the "Re-aligning Memory..."
+                      //                          overlay in SequenceView.
+                      // slabVersion: new value → diverges from
+                      //                          slabAcknowledgedVersion, which
+                      //                          provides a secondary guard signal.
+                      set({
+                        isRealigning: true,
+                        slabVersion : verifyResult.slabVersion,
+                      });
+
+                      get().addSystemLog({
+                        timestamp: Date.now(),
+                        category : 'MEMORY',
+                        message  :
+                          `⚠️ Frozen Recovery triggered: slab state diverged from ` +
+                          `cloud HEAD "${chronosHead}". ` +
+                          `Initiating full genome re-load (slabVersion=${verifyResult.slabVersion}).`,
+                        level: 'warning',
+                      });
+
+                      // ── FR-01 Phase 3 — Recovery: full cloud re-load ───────
+                      //
+                      // loadGenomeFromCloud:
+                      //   1. Calls RESET_ENGINE (clears worker state).
+                      //   2. Downloads the FASTA blob from the signed URL.
+                      //   3. Streams it to the worker in 64 KiB chunks.
+                      //   4. Calls RESTORE_HISTORY (replays all Chronos commits).
+                      //   5. Calls fetchGenomeMetadata → updates store.
+                      //
+                      // The worker's SlabManager.setCurrentTxId(headCommitId)
+                      // is called inside RESTORE_HISTORY, so after the reload
+                      // the next VERIFY_SLAB_STATE will return 'ok'.
+                      //
+                      // We read activeGenomeId fresh from the store in case it
+                      // changed since the outer COMMIT_SYNC closure closed over it.
+                      const genomeIdForReload = get().activeGenomeId;
+                      if (!genomeIdForReload) {
+                        // No active genome — cannot recover. Clear the flag so
+                        // the overlay doesn't freeze indefinitely.
+                        set({ isRealigning: false });
+                        get().addSystemLog({
+                          timestamp: Date.now(),
+                          category : 'MEMORY',
+                          message  : '❌ Frozen Recovery aborted: no active genome ID.',
+                          level    : 'error',
+                        });
+                        return;
+                      }
+
+                      get()
+                        .loadGenomeFromCloud(genomeIdForReload)
+                        .then(() => {
+                          // ── Phase 3 complete — update acknowledgment version ─
+                          //
+                          // setViewportData (called inside requestViewport inside
+                          // loadGenomeFromCloud) will have already set
+                          // slabAcknowledgedVersion = slabVersion. We clear
+                          // isRealigning here as the definitive "done" signal.
+                          set({ isRealigning: false });
+
+                          get().addSystemLog({
+                            timestamp: Date.now(),
+                            category : 'MEMORY',
+                            message  : '✅ Frozen Recovery complete: slab memory re-aligned with cloud state.',
+                            level    : 'success',
+                          });
+                        })
+                        .catch((reloadErr: unknown) => {
+                          // Re-load failed — clear isRealigning so the UI
+                          // doesn't freeze. The user will see an error log.
+                          set({ isRealigning: false });
+
+                          get().addSystemLog({
+                            timestamp: Date.now(),
+                            category : 'MEMORY',
+                            message  :
+                              `❌ Frozen Recovery failed: could not re-load genome from cloud. ` +
+                              `${reloadErr instanceof Error ? reloadErr.message : String(reloadErr)}. ` +
+                              `Manual page reload may be required.`,
+                            level: 'error',
+                          });
+                        });
+                    })
+                    .catch((verifyErr: unknown) => {
+                      // VERIFY_SLAB_STATE itself failed (worker error, timeout).
+                      // Non-fatal — log a warning but don't block the UI.
+                      console.warn(
+                        '[Arkhé] VERIFY_SLAB_STATE failed:',
+                        verifyErr,
+                      );
+                      get().addSystemLog({
+                        timestamp: Date.now(),
+                        category : 'MEMORY',
+                        message  :
+                          `⚠️ Slab verification failed (non-fatal): ` +
+                          `${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)}. ` +
+                          `Data integrity cannot be confirmed.`,
+                        level: 'warning',
+                      });
+                    });
                 })
                 .catch((err) => console.error('Sync error:', err));
             }
@@ -404,8 +675,7 @@ export const createGenomeSlice: StateCreator<
           // ── Threat screening result ─────────────────────────────────────
           case 'SCREEN_THREATS_RESULT':
             set({
-              threatMatches:
-                payload as ArkheState['threatMatches'],
+              threatMatches: payload as ArkheState['threatMatches'],
             });
             break;
         }
@@ -421,7 +691,7 @@ export const createGenomeSlice: StateCreator<
           : false);
 
       await postAndWait(worker, 'INIT', {
-        slabSize: 1_048_576,
+        slabSize     : 1_048_576,
         useSharedArray: useShared,
       });
 
@@ -430,7 +700,7 @@ export const createGenomeSlice: StateCreator<
       console.error('[ArkheEngine] Worker initialisation failed:', err);
       set({
         workerConnected: false,
-        workerError:
+        workerError    :
           err instanceof Error
             ? err.message
             : 'Unknown worker initialisation error',
@@ -450,28 +720,35 @@ export const createGenomeSlice: StateCreator<
   /**
    * loadFile
    *
-   * Uploads a genome file to cloud storage via PersistenceManager, then
-   * streams it to the engine worker in 64 KiB chunks.
+   * ── LB-09 FIX: Proper state replacement for slabMetas / editedSlabs ───────
+   * OLD (buggy):
+   *   get().slabMetas.clear();   // mutates the Map stored in Zustand state
+   *   get().editedSlabs.clear(); // mutates the Set stored in Zustand state
    *
-   * ── AUDIT III FIX 1 (Vector D) ────────────────────────────────────────────
-   * STREAM_END is sent after the chunk loop so the worker flushes its partial
-   * staging buffer before fetchGenomeMetadata() queries the engine state.
+   *   Zustand's shallow-diff renderer compares object references. When you
+   *   call `.clear()` on the existing Map/Set in place, the reference doesn't
+   *   change, so Zustand never schedules a re-render. Subscribers (e.g. the
+   *   slab viewport) continue reading the old, mutated-but-not-notified data.
    *
-   * ── SPRINT 5 FIX 5 (Adaptive Slab Sizing) ─────────────────────────────────
-   * file.size is forwarded to RESET_ENGINE so the worker can select an optimal
-   * slab size for the incoming genome.
+   * NEW (correct):
+   *   set({ slabMetas: new Map(), editedSlabs: new Set() });
+   *
+   *   Handing Zustand fresh references guarantees a reference-change diff,
+   *   triggering the correct subscriber notifications.
+   *
+   * ── AUDIT III FIX 1 (Vector D) — STREAM_END retained ────────────────────
+   * ── SPRINT 5 FIX 5 — Adaptive slab sizing retained ───────────────────────
    */
   loadFile: async (file: File, name?: string) => {
     const { worker, user } = get();
     if (!worker) throw new Error('Worker not initialised');
-    if (!user) throw new Error('User not authenticated');
+    if (!user)   throw new Error('User not authenticated');
 
     // Reset engine with adaptive slab size hint (SPRINT 5 FIX 5).
     await postAndWait(worker, 'RESET_ENGINE', { expectedFileSize: file.size });
 
-    // Clear any leftover local maps from a previous genome.
-    get().slabMetas.clear();
-    get().editedSlabs.clear();
+    // ── LB-09 FIX ─────────────────────────────────────────────────────────
+    set({ slabMetas: new Map(), editedSlabs: new Set() });
 
     // Nudge the GC in V8-based environments (best-effort, non-blocking).
     const g = globalThis as unknown as { gc?: () => void };
@@ -490,9 +767,9 @@ export const createGenomeSlice: StateCreator<
       set({ isSyncing: false });
       get().addSystemLog({
         timestamp: Date.now(),
-        category: 'SYSTEM',
-        message: `❌ Genome upload failed: ${uploadResult.error}`,
-        level: 'error',
+        category : 'SYSTEM',
+        message  : `❌ Genome upload failed: ${uploadResult.error}`,
+        level    : 'error',
       });
       throw new Error(uploadResult.error!);
     }
@@ -502,17 +779,17 @@ export const createGenomeSlice: StateCreator<
 
     get().addSystemLog({
       timestamp: Date.now(),
-      category: 'SYSTEM',
-      message: `📤 Genome uploaded: ${genome.name} (${genome.id})`,
-      level: 'success',
+      category : 'SYSTEM',
+      message  : `📤 Genome uploaded: ${genome.name} (${genome.id})`,
+      level    : 'success',
     });
 
     // ── Stream to worker ──────────────────────────────────────────────────
     const fileId = generateId();
-    let offset = 0;
+    let offset   = 0;
 
     while (offset < file.size) {
-      const chunk = file.slice(offset, offset + STREAM_CHUNK_SIZE);
+      const chunk       = file.slice(offset, offset + STREAM_CHUNK_SIZE);
       const arrayBuffer = await chunk.arrayBuffer();
       await postAndWait(
         worker,
@@ -523,7 +800,7 @@ export const createGenomeSlice: StateCreator<
       offset += STREAM_CHUNK_SIZE;
     }
 
-    // FIX 1 — flush the final partial staging buffer.
+    // AUDIT III FIX 1 — flush the final partial staging buffer.
     await postAndWait(worker, 'STREAM_END', { fileId });
 
     // ── Post-load metadata + length write-back ────────────────────────────
@@ -539,32 +816,34 @@ export const createGenomeSlice: StateCreator<
 
     get().addSystemLog({
       timestamp: Date.now(),
-      category: 'SYSTEM',
-      message: `🧬 Genome loaded: ${genomeLength.toLocaleString()} bp`,
-      level: 'success',
+      category : 'SYSTEM',
+      message  : `🧬 Genome loaded: ${genomeLength.toLocaleString()} bp`,
+      level    : 'success',
     });
   },
 
   /**
    * loadGenomeFromCloud
    *
-   * Restores a genome session from Supabase: fetches the FASTA blob,
-   * re-streams it to the engine worker, and replays Chronos history.
-   *
    * ── SPRINT 5 FIX 2 (teardown safety) ─────────────────────────────────────
-   * The streaming loop runs inside try/finally so:
-   *   • On failure — a RESET_ENGINE clears partial state and isSyncing is
-   *     reset before the error propagates.
-   *   • On success — isSyncing is always reset in the finally block.
+   * The streaming loop is wrapped in try/finally so STREAM_END and isSyncing
+   * reset are guaranteed even on network failure.
    *
    * ── AUDIT III FIX 1 (Vector D) ────────────────────────────────────────────
    * STREAM_END is sent inside the try block so the worker flushes its partial
-   * staging buffer even if the very last chunk is the one that fails.
+   * staging buffer.
+   *
+   * ── FR-01 NOTE ─────────────────────────────────────────────────────────────
+   * This method is also the recovery path for the Frozen Recovery fix.
+   * When called from the COMMIT_SYNC realignment handler, `isRealigning` will
+   * already be true and will be cleared by the caller upon completion.
+   * This method itself does NOT touch `isRealigning` to avoid conflicting with
+   * the caller's lifecycle management.
    */
   loadGenomeFromCloud: async (genomeId: string) => {
     const { worker, user } = get();
     if (!worker) throw new Error('Worker not initialised');
-    if (!user) throw new Error('User not authenticated');
+    if (!user)   throw new Error('User not authenticated');
 
     set({ isSyncing: true, activeGenomeId: genomeId });
 
@@ -574,23 +853,25 @@ export const createGenomeSlice: StateCreator<
       set({ isSyncing: false });
       get().addSystemLog({
         timestamp: Date.now(),
-        category: 'SYSTEM',
-        message: `❌ Session restore failed: ${restoreResult.error}`,
-        level: 'error',
+        category : 'SYSTEM',
+        message  : `❌ Session restore failed: ${restoreResult.error}`,
+        level    : 'error',
       });
       throw new Error(restoreResult.error!);
     }
 
     const {
       genome,
-      commits: supabaseCommits,
-      branches: supabaseBranches,
+      commits  : supabaseCommits,
+      branches : supabaseBranches,
       headCommit: supabaseHeadCommit,
     } = restoreResult.data!;
 
-    const convertedCommits = supabaseCommits.map(convertSupabaseCommitToArkhe);
-    const convertedBranches = supabaseBranches.map(convertSupabaseBranchToArkhe);
-    const convertedHeadCommit = convertSupabaseCommitToArkhe(supabaseHeadCommit);
+    // convertSupabaseCommitToArkhe now unpacks mutations from snapshot_meta
+    // (LB-01 fix) and reads childrenTxIds from the augmentation (LB-08 fix).
+    const convertedCommits     = supabaseCommits.map(convertSupabaseCommitToArkhe);
+    const convertedBranches    = supabaseBranches.map(convertSupabaseBranchToArkhe);
+    const convertedHeadCommit  = convertSupabaseCommitToArkhe(supabaseHeadCommit);
 
     // ── Reset engine with adaptive slab size ──────────────────────────────
     await postAndWait(worker, 'RESET_ENGINE', {
@@ -607,11 +888,11 @@ export const createGenomeSlice: StateCreator<
 
     // ── Stream to worker (SPRINT 5 FIX 2: guaranteed teardown) ───────────
     const fileId = generateId();
-    let offset = 0;
+    let offset   = 0;
 
     try {
       while (offset < file.size) {
-        const chunk = file.slice(offset, offset + STREAM_CHUNK_SIZE);
+        const chunk       = file.slice(offset, offset + STREAM_CHUNK_SIZE);
         const arrayBuffer = await chunk.arrayBuffer();
         await postAndWait(
           worker,
@@ -622,7 +903,7 @@ export const createGenomeSlice: StateCreator<
         offset += STREAM_CHUNK_SIZE;
       }
 
-      // FIX 1 — flush the final partial staging buffer.
+      // AUDIT III FIX 1 — flush the final partial staging buffer.
       await postAndWait(worker, 'STREAM_END', { fileId });
     } catch (err) {
       // Clear partial engine state so the next load attempt starts clean.
@@ -632,8 +913,8 @@ export const createGenomeSlice: StateCreator<
 
       get().addSystemLog({
         timestamp: Date.now(),
-        category: 'SYSTEM',
-        message: `❌ Genome stream failed: ${
+        category : 'SYSTEM',
+        message  : `❌ Genome stream failed: ${
           err instanceof Error ? err.message : String(err)
         }`,
         level: 'error',
@@ -646,29 +927,42 @@ export const createGenomeSlice: StateCreator<
     }
 
     // ── Replay Chronos history in the worker ──────────────────────────────
+    // FR-01: After RESTORE_HISTORY the worker calls
+    // slabManager.setCurrentTxId(headCommitId), so the next VERIFY_SLAB_STATE
+    // will return 'ok' and confirm the recovery is clean.
     await postAndWait(worker, 'RESTORE_HISTORY', {
-      commits: convertedCommits,
-      branches: convertedBranches,
+      commits     : convertedCommits,
+      branches    : convertedBranches,
       headCommitId: convertedHeadCommit.txId,
     });
 
     await get().fetchGenomeMetadata();
 
     set({
-      commits: convertedCommits,
-      branches: convertedBranches,
-      chronosHead: convertedHeadCommit.txId,
+      commits      : convertedCommits,
+      branches     : convertedBranches,
+      chronosHead  : convertedHeadCommit.txId,
       currentBranch:
         convertedBranches.find(
           (b) => b.headCommitId === convertedHeadCommit.txId,
         )?.name ?? 'main',
     });
 
+    // ── FR-01: Acknowledge the current slabVersion ─────────────────────
+    // We've just reloaded from the authoritative cloud state. The slabs are
+    // now consistent. Stamp slabAcknowledgedVersion = slabVersion so
+    // SequenceView's secondary guard (slabVersion !== slabAcknowledgedVersion)
+    // resolves. The viewport has also been refreshed by fetchGenomeMetadata →
+    // requestViewport → setViewportData, which stamped viewportVersion.
+    set((state) => ({
+      slabAcknowledgedVersion: state.slabVersion,
+    }));
+
     get().addSystemLog({
       timestamp: Date.now(),
-      category: 'SYSTEM',
-      message: `🔄 Session restored: ${genome.name}, ${convertedCommits.length} commits`,
-      level: 'success',
+      category : 'SYSTEM',
+      message  : `🔄 Session restored: ${genome.name}, ${convertedCommits.length} commits`,
+      level    : 'success',
     });
   },
 
@@ -681,20 +975,27 @@ export const createGenomeSlice: StateCreator<
     if (!worker) throw new Error('Worker not initialised');
     const metadata = await postAndWait<{
       genomeLength: number;
-      slabMetas: SlabMeta[];
+      slabMetas   : SlabMeta[];
     }>(worker, 'GET_GENOME_METADATA');
     set({ genomeLength: metadata.genomeLength });
     get().updateSlabMeta(metadata.slabMetas);
     return metadata;
   },
 
-  requestViewport: async (start: number, end: number): Promise<SliceResponse> => {
+  requestViewport: async (start: number, end: number): Promise<SliceResponse | null> => {
     const { worker } = get();
     if (!worker) throw new Error('Worker not initialised');
-    const result = await postAndWait<SliceResponse>(worker, 'LOAD_SLICE', {
-      start,
-      end,
-    });
+
+    let result: SliceResponse;
+    try {
+      result = await postAndWait<SliceResponse>(worker, 'LOAD_SLICE', { start, end });
+    } catch (err) {
+      if (err instanceof Error && (err as any).cancelled) {
+        return null; // superseded — a fresher request is in flight
+      }
+      throw err; // real worker error — propagate
+    }
+
     get().setViewportData(result);
     return result;
   },
@@ -756,8 +1057,8 @@ export const createGenomeSlice: StateCreator<
         forwardPrimer,
         reversePrimer,
         maxMismatches: options?.maxMismatches ?? 2,
-        minProduct: options?.minProduct ?? 50,
-        maxProduct: options?.maxProduct ?? 5_000,
+        minProduct   : options?.minProduct    ?? 50,
+        maxProduct   : options?.maxProduct    ?? 5_000,
       });
       set({ pcrResults: results });
       return results;
@@ -804,7 +1105,7 @@ export const createGenomeSlice: StateCreator<
 
   exportMutantFasta: async (): Promise<{
     filename: string;
-    content: string;
+    content : string;
   }> => {
     const { worker } = get();
     if (!worker) throw new Error('Worker not initialised');
@@ -815,10 +1116,10 @@ export const createGenomeSlice: StateCreator<
         'EXPORT_MUTANT_FASTA',
       );
       // Trigger browser download.
-      const blob = new Blob([result.content], { type: 'text/plain' });
-      const url = URL.createObjectURL(blob);
+      const blob   = new Blob([result.content], { type: 'text/plain' });
+      const url    = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
-      anchor.href = url;
+      anchor.href     = url;
       anchor.download = result.filename;
       anchor.click();
       URL.revokeObjectURL(url);
@@ -884,9 +1185,9 @@ export const createGenomeSlice: StateCreator<
   },
 
   predictIsoforms: async (
-    start: number,
-    end: number,
-    orf: ORF,
+    start     : number,
+    end       : number,
+    orf       : ORF,
     spliceSites: SpliceSite[],
   ): Promise<SpliceIsoform[]> => {
     const { worker } = get();
@@ -943,7 +1244,7 @@ export const createGenomeSlice: StateCreator<
   // ─────────────────────────────────────────────────────────────────────────
 
   runOffTargetHeatmap: async (
-    query: string,
+    query       : string,
     maxMismatch = 2,
   ): Promise<OffTargetHit[]> => {
     const { worker } = get();
@@ -968,7 +1269,7 @@ export const createGenomeSlice: StateCreator<
   // § Diff mode
   // ─────────────────────────────────────────────────────────────────────────
 
-  setComparisonSequence: (seq) => set({ comparisonSequence: seq }),
+  setComparisonSequence: (seq: string | null) => set({ comparisonSequence: seq }),
   toggleDiffMode: () =>
     set((state) => ({ diffMode: !state.diffMode })),
 
@@ -1008,8 +1309,8 @@ export const createGenomeSlice: StateCreator<
   // § Internal setters
   // ─────────────────────────────────────────────────────────────────────────
 
-  setWorkerConnected: (connected) => set({ workerConnected: connected }),
-  setWorkerError: (error) => set({ workerError: error }),
+  setWorkerConnected: (connected: boolean) => set({ workerConnected: connected }),
+  setWorkerError    : (error: string | null) => set({ workerError: error }),
 
   updateSlabMeta: (metas: SlabMeta[]) =>
     set((state) => {
@@ -1026,45 +1327,55 @@ export const createGenomeSlice: StateCreator<
     }),
 
   /**
-   * setViewportData
+   * setViewportData – LB-11/14 atomic update with version increment.
    *
    * Writes a LOAD_SLICE response into the viewport and its denormalised
-   * sibling fields (sliceSpliceSites, sliceIsoforms, sliceProteinProperties).
+   * sibling fields (sliceSpliceSites, sliceIsoforms, sliceProteinProperties),
+   * and increments viewportVersion to signal a consistent snapshot.
    *
-   * NOTE: The top-level `features` array was removed in the State Bloat Fix.
-   * Feature data is stored exclusively in `viewport.features`.
+   * FR-01: Also stamps slabAcknowledgedVersion = slabVersion at the moment
+   * the viewport is committed. This ensures that a fresh viewport fetch
+   * AFTER a hard reset (slabVersion++ fired) immediately resolves the
+   * SequenceView's secondary guard condition
+   * (slabVersion !== slabAcknowledgedVersion). The primary guard (isRealigning)
+   * is cleared separately by the COMMIT_SYNC realignment handler.
    */
   setViewportData: (data: SliceResponse) => {
-    set({
+    set((state) => ({
       viewport: {
-        start: data.start,
-        end: data.end,
-        buffer: data.buffer,
-        sequence: data.sequence,
-        translations: data.translations,
-        gcPercent: data.gcPercent,
-        features: data.features,
-        orfs: data.orfs,
-        spliceSites: data.spliceSites,
-        isoforms: data.isoforms,
+        start           : data.start,
+        end             : data.end,
+        buffer          : data.buffer,
+        sequence        : data.sequence,
+        translations    : data.translations,
+        gcPercent       : data.gcPercent,
+        features        : data.features,
+        orfs            : data.orfs,
+        spliceSites     : data.spliceSites,
+        isoforms        : data.isoforms,
         proteinProperties: data.proteinProperties,
       },
-      sliceSpliceSites: data.spliceSites ?? [],
-      sliceIsoforms: data.isoforms ?? [],
-      sliceProteinProperties: data.proteinProperties ?? null,
-    });
+      viewportVersion         : state.viewportVersion + 1,         // LB-11/14
+      slabAcknowledgedVersion : state.slabVersion,                  // FR-01
+      sliceSpliceSites        : data.spliceSites      ?? [],
+      sliceIsoforms           : data.isoforms         ?? [],
+      sliceProteinProperties  : data.proteinProperties ?? null,
+    }));
   },
 
-  setSyncing: (val) => set({ isSyncing: val }),
-  setPCRResults: (results) => set({ pcrResults: results }),
-  setRestrictionSites: (sites) => set({ restrictionSites: sites }),
-  setRadarData: (data) => set({ radarData: data }),
-  setPublicGenomes: (genomes) => set({ publicGenomes: genomes }),
-  setLoadingPublic: (loading) => set({ isLoadingPublic: loading }),
-  setDiffMode: (mode) => set({ diffMode: mode }),
-  setOffTargetHits: (hits) => set({ offTargetHits: hits }),
-  setSyntenyAnchors: (anchors) => set({ syntenyAnchors: anchors }),
-  setScanningSynteny: (scanning) => set({ isScanningSynteny: scanning }),
-  setORFScanResult: (result) => set({ orfScanResult: result }),
-  setORFScanning: (scanning) => set({ isORFScanning: scanning }),
+  setSyncing         : (val: boolean)            => set({ isSyncing: val }),
+  setPCRResults      : (results: PCRProduct[])   => set({ pcrResults: results }),
+  setRestrictionSites: (sites: RestrictionSite[]) => set({ restrictionSites: sites }),
+  setRadarData       : (data: RadarBin[])        => set({ radarData: data }),
+  setPublicGenomes   : (genomes: PublicGenome[]) => set({ publicGenomes: genomes }),
+  setLoadingPublic   : (loading: boolean)        => set({ isLoadingPublic: loading }),
+  setDiffMode        : (mode: boolean)           => set({ diffMode: mode }),
+  setOffTargetHits   : (hits: OffTargetHit[])   => set({ offTargetHits: hits }),
+  setSyntenyAnchors  : (anchors: SyntenyAnchor[]) => set({ syntenyAnchors: anchors }),
+  setScanningSynteny : (scanning: boolean)       => set({ isScanningSynteny: scanning }),
+  setORFScanResult   : (result: ArkheState['orfScanResult']) => set({ orfScanResult: result }),
+  setORFScanning     : (scanning: boolean)       => set({ isORFScanning: scanning }),
+
+  // FR-01: Setter for the realignment flag (exposed for testing / manual override)
+  setIsRealigning: (realigning: boolean) => set({ isRealigning: realigning }),
 });

@@ -45,18 +45,23 @@ import { createClient } from '@supabase/supabase-js';
 import { supabase } from '@/lib/supabase';
 import { PersistenceManager } from '@/lib/PersistenceManager';
 import { useArkheStore } from '@/store';
+import { get } from 'idb-keyval';
+import { validateSovereignUrl } from '@/store/utils';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type PrimaryTab = 'research' | 'guest';
 type SovStatus  = 'idle' | 'testing' | 'ok' | 'fail';
 
-// ── Tiny util: check stored sovereign creds on mount ─────────────────────────
-function readSovereignCreds(): { url: string; key: string } {
-  if (typeof localStorage === 'undefined') return { url: '', key: '' };
-  return {
-    url: localStorage.getItem('ARKHE_CUSTOM_SUPABASE_URL') ?? '',
-    key: localStorage.getItem('ARKHE_CUSTOM_SUPABASE_KEY') ?? '',
-  };
+// ── Tiny util: check stored sovereign creds on mount (LB-02 & LB-0C fix: now async) ─────────────────
+async function readSovereignCreds(): Promise<{ url: string; key: string }> {
+  if (typeof window === 'undefined' || typeof indexedDB === 'undefined') return { url: '', key: '' };
+  try {
+    const url = await get<string>('ARKHE_CUSTOM_SUPABASE_URL') ?? '';
+    const key = await get<string>('ARKHE_CUSTOM_SUPABASE_KEY') ?? '';
+    return { url, key };
+  } catch {
+    return { url: '', key: '' };
+  }
 }
 
 // ── SVG logo ─────────────────────────────────────────────────────────────────
@@ -151,11 +156,14 @@ export default function AuthOverlay({ onDismiss }: { onDismiss?: () => void }) {
 
   const scanRef = useRef<HTMLDivElement>(null);
 
-  // Hydrate sovereign fields from localStorage on mount
+  // Hydrate sovereign fields from IndexedDB on mount (LB-02 & LB-0C fix)
   useEffect(() => {
-    const { url, key } = readSovereignCreds();
-    if (url) setSovUrl(url);
-    if (key) setSovKey(key);
+    const loadCreds = async () => {
+      const { url, key } = await readSovereignCreds();
+      if (url) setSovUrl(url);
+      if (key) setSovKey(key);
+    };
+    loadCreds();
   }, []);
 
   // ── FIX 4B — Reset sovStatus and sovError when user edits either field ────
@@ -238,14 +246,20 @@ export default function AuthOverlay({ onDismiss }: { onDismiss?: () => void }) {
       setSovError('Both Supabase URL and Anon Key are required.');
       return;
     }
-    if (!trimUrl.startsWith('https://')) {
+    
+    // LB-05 FIX: Apply validateSovereignUrl check before testing connection
+    let sanitisedUrl: string;
+    try {
+      sanitisedUrl = validateSovereignUrl(trimUrl);
+    } catch (err) {
       setSovStatus('fail');
-      setSovError('URL must begin with https://');
+      setSovError(err instanceof Error ? err.message : 'Invalid Sovereign Mode URL');
       return;
     }
 
     try {
-      const testClient = createClient(trimUrl, trimKey);
+      // LB-05 FIX: Use validated URL instead of raw user input
+      const testClient = createClient(sanitisedUrl, trimKey);
       const { error } = await testClient.from('profiles').select('id').limit(1);
 
       if (error) {

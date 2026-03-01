@@ -326,16 +326,18 @@ export default function ProteinViewport() {
       />
 
       {/*
-        ── FIX 1 + FIX 3: Scientific Honesty Badge — TOP LEFT, z-[100] ──────
+        ── FIX 1 + FIX 3: Scientific Honesty Badge — TOP LEFT, z-[99999] ──────
         ── FIX 1: No type cast. `proteinFold` is ProteinFold from arkhe.d.ts.
         ──         All fields (method, warning, rateLimitNotice) are canonical.
-        ── FIX 3: z-[100] exceeds all default Tailwind z-index utilities (max
-        ──         z-50) so this badge cannot be occluded by any sibling panel.
+        ── FIX 3: z-[99999] exceeds all default Tailwind z-index utilities (max
+        ──         z-50) and even Radix UI Dialogs (z-[9999]) so this badge cannot
+        ──         be occluded by any sibling panel or overlay.
         ── The clinical warning MUST always be visible when heuristic coords
         ── are displayed. It must never be hidden, toggled, or minimised.
+        ── LB-13 FIX: Added CSS isolation to guarantee stacking context.
       */}
       {!isLoading && proteinFold && (
-        <div className="absolute top-4 left-4 z-[100] flex flex-col gap-2 max-w-[220px]">
+        <div className="absolute top-4 left-4 z-[99999] flex flex-col gap-2 max-w-[220px] isolate">
 
           {/* Method Badge */}
           {proteinFold.method && (
@@ -355,7 +357,7 @@ export default function ProteinViewport() {
             Must never be hidden or toggled off.
           */}
           {proteinFold.warning && (
-            <div className="bg-yellow-500/15 backdrop-blur-sm border border-yellow-400/50 rounded-md px-3 py-2 shadow-lg">
+            <div className="bg-yellow-500/15 backdrop-blur-sm border border-yellow-400/50 rounded-md px-3 py-2 shadow-lg z-[99999] isolate">
               <div className="flex items-start gap-2">
                 <svg
                   className="w-4 h-4 text-yellow-400 mt-0.5 flex-shrink-0"

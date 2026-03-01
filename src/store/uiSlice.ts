@@ -96,7 +96,7 @@ const initialUIState = {
   // Offline / sovereign
   isOfflineMode: false,
   offlineModeReason: null as string | null,
-  sovereignModeActive: PersistenceManager.isSovereignModeActive(),
+  sovereignModeActive: false, // LB-02 & LB-0C: Initialize as false, update asynchronously
 
   // Sentinel
   sentinelData: null as SentinelSummary | null,
@@ -146,13 +146,14 @@ export const createUISlice: StateCreator<
   //      so the Sovereignty Settings panel knows whether a CTA is appropriate.
   //   3. Surfaces a prominent warning in the system log with the suggested
   //      remediation action.
-  PersistenceManager.onCircuitBreakerTripped = (
+  PersistenceManager.onCircuitBreakerTripped = async (
     notification: CircuitBreakerNotification,
   ) => {
+    const sovereignActive = await PersistenceManager.isSovereignModeActive();
     set({
       isOfflineMode: true,
       offlineModeReason: notification.reason,
-      sovereignModeActive: PersistenceManager.isSovereignModeActive(),
+      sovereignModeActive: sovereignActive,
     });
 
     // get() is safe here because the callback fires after the store is created.
@@ -220,9 +221,9 @@ export const createUISlice: StateCreator<
     //   A malicious or misconfigured URL passed to activateSovereignMode could
     //   redirect every genome sync call to an attacker-controlled server,
     //   exfiltrating proprietary genomic data (SSRF / data exfiltration).
-    //   Because PersistenceManager persists the URL to localStorage and uses it
+    //   Because PersistenceManager persists the URL to IndexedDB and uses it
     //   for every subsequent sync call, the URL must be validated BEFORE any
-    //   write to localStorage or PersistenceManager.
+    //   write to IndexedDB or PersistenceManager.
     //
     // FIVE-GATE PIPELINE (implemented in validateSovereignUrl, utils.ts):
     //   Gate 1 — WHATWG URL parse (rejects non-URL strings)
@@ -246,7 +247,7 @@ export const createUISlice: StateCreator<
      * should catch it and display the `.message` as an inline field error
      * adjacent to the URL input.
      */
-    activateSovereignMode: (url: string, key: string) => {
+    activateSovereignMode: async (url: string, key: string) => {
       // ── API key basic hygiene ───────────────────────────────────────────────
       // Supabase JWTs are always non-empty strings.  Reject obviously wrong
       // values before any network I/O so the error message is maximally helpful.
@@ -283,9 +284,9 @@ export const createUISlice: StateCreator<
 
       // ── Delegate to PersistenceManager (sanitised origin only) ─────────────
       // Pass the sanitised origin string — never the raw user input — so no
-      // unsanitised value ever reaches localStorage.
+      // unsanitised value ever reaches IndexedDB.
       try {
-        PersistenceManager.activateSovereignMode(sanitisedUrl, trimmedKey);
+        await PersistenceManager.activateSovereignMode(sanitisedUrl, trimmedKey);
 
         set({
           isOfflineMode: false,
@@ -315,8 +316,8 @@ export const createUISlice: StateCreator<
       }
     },
 
-    deactivateSovereignMode: () => {
-      PersistenceManager.deactivateSovereignMode();
+    deactivateSovereignMode: async () => {
+      await PersistenceManager.deactivateSovereignMode();
       set({ sovereignModeActive: false });
       get().addSystemLog({
         timestamp: Date.now(),

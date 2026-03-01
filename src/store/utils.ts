@@ -92,7 +92,10 @@ export function postAndWait<T = unknown>(
       handler = null;
 
       if (e.data.type === 'ERROR') {
-        reject(new Error(e.data.payload.message));
+        reject(new Error(e.data.payload?.message ?? 'Unknown worker error'));
+      } else if (e.data.type === 'SLICE_CANCELLED') {
+        // DOOMSDAY PATCH: Reject cancellations so they don't corrupt the viewport
+        reject(Object.assign(new Error('SLICE_CANCELLED'), { cancelled: true }));
       } else {
         resolve(e.data.payload as T);
       }

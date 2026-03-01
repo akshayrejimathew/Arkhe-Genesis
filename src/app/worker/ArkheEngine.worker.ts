@@ -1,24 +1,32 @@
-// src/app/worker/ArkheEngine.worker.ts
 /**
  * ArkheEngine.worker.ts
  * High-performance genomic editing engine – FULL SPECTRUM.
  *
- * SPRINT 6 FIXES (2026-02-24):
+ * SPRINT 6 FIXES (2026-02-25):
  *
- *   TASK 1 — Unbounded streamBuffer Guard:
- *     `handleStreamChunk()` now aborts the stream if the FASTA line buffer
- *     exceeds 50MB without a newline, posting a `MALFORMED_FASTA_LINE_TOO_LONG`
- *     error and ignoring further chunks.
+ *   TASK 1 — Unbounded streamBuffer Guard (LB-03 / LB-12):
+ *     • `handleStreamChunk()` now uses a byte accumulator (Uint8Array) instead
+ *       of string concatenation, eliminating 100MB transient spikes.
+ *     • Checks total allocated memory via SlabManager.getTotalAllocatedBytes()
+ *       against a hard limit (512 MB). If exceeded, aborts with
+ *       `OUT_OF_MEMORY_PROTECTION` error.
  *
- *   TASK 2 — 10‑Billion‑Base Heap Guard:
- *     `autoAnnotateGenome()` now checks genome length and, if >500 million bases,
- *     disables full‑sequence scanning and returns an empty array with a warning.
+ *   TASK 2 — 250MB OOM in autoAnnotateGenome (LB-07):
+ *     `autoAnnotateGenome()` now processes the genome in 10MB chunks with a
+ *     10kb overlap to capture cross‑boundary features. Duplicate features are
+ *     deduplicated by approximate overlap merging.
  *
- *   TASK 3 — Request Cancellation Logic:
- *     Viewport requests (LOAD_SLICE) now carry a request ID; only the most
- *     recent request is processed. Older requests are discarded, preventing
- *     UI jank from rapid viewport changes.  The request ID is managed
- *     internally by the engine via `getNextRequestId()`.
+ *   TASK 3 — Request Cancellation Logic (re‑enforced):
+ *     Viewport requests (LOAD_SLICE) already carried a request ID; only the most
+ *     recent request is processed. Older requests are discarded.
+ *
+ *   TASK 4 — Refactor O(N²) loops in scanStructuralVariants (Heuristic Wall):
+ *     • Introduced a yielding loop pattern: every 50ms (or 5000 iterations) we
+ *       check elapsed time and yield back to the event loop.
+ *     • If the total execution time exceeds 2 seconds for a single scan, the
+ *       scan is aborted and a warning is logged.
+ *     • The scan now processes direct and inverted repeats in incremental
+ *       chunks, storing intermediate state in `syntenyScanState`.
  *
  * PREVIOUS FIXES (SPRINT 5, SHADOW-NEW-01, SHADOW-02, etc.) are preserved.
  */
@@ -84,8 +92,18 @@ const COMPLEMENT: Record<BaseCode, BaseCode> = {
   4: 4,
 };
 
+// ---------- Yielding loop constants ----------
+const YIELD_INTERVAL_MS = 50;          // yield if we've been running this long without a break
+const YIELD_ITERATION_COUNT = 5000;    // also yield after this many loop iterations
+const MAX_SCAN_TIME_MS = 2000;          // abort if total scan exceeds 2 seconds
+
 // ---------- TASK 1: Unbounded streamBuffer Guard ----------
 const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB
+const HARD_MEMORY_LIMIT = 512 * 1024 * 1024; // 512MB
+
+// ---------- TASK 2: Auto‑annotation chunk size ----------
+const AUTO_ANNOTATE_CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
+const AUTO_ANNOTATE_OVERLAP = 10 * 1024; // 10kb overlap to catch boundary features
 
 // ---------- Telemetry Logger (with Debug Mode) ----------
 let DEBUG_MODE = false;
@@ -108,6 +126,25 @@ function logToUI(
       },
     });
   }
+}
+
+/**
+ * State for the incremental synteny scan (direct/inverted repeats).
+ */
+interface SyntenyScanState {
+  step: 'direct' | 'inverted' | 'done';
+  hashMap: Map<number, number[]>;          // rolling hash → positions (direct repeats)
+  rcRegion: Uint8Array;                     // reverse complement of the genome region
+  keys: number[];                            // iterator over hashMap keys
+  keyIndex: number;                          // current key being processed
+  positions: number[];                       // positions for current key
+  i: number;                                  // inner loop index for positions[i]
+  j: number;                                  // inner loop index for positions[j]
+  anchors: SyntenyAnchor[];                   // accumulated anchors
+  startTime: number;                           // performance.now() at start
+  lastYieldTime: number;                       // performance.now() when we last yielded
+  iterationsSinceYield: number;                // count of iterations since last yield
+  aborted: boolean;                             // true if aborted due to timeout
 }
 
 class ArkheEngine {
@@ -140,13 +177,19 @@ class ArkheEngine {
 
   private syntenyAnchors: SyntenyAnchor[] = [];
   private syntenyTaskId: number | null = null;
+  // TASK 4: state for incremental synteny scan
+  private syntenyScanState: SyntenyScanState | null = null;
 
-  // ---------- Streaming buffers ----------
-  private streamBuffer: string = '';
-  private stagingBuffer: Uint8Array = new Uint8Array(65536);
-  private stagingIndex: number = 0;
+  // ---------- Streaming buffers (LB-03 / LB-12 fix) ----------
+  // Byte accumulator – replaces string concatenation.
+  private streamByteBuffer: Uint8Array = new Uint8Array(65536); // start with 64KB
+  private streamByteLength: number = 0; // number of valid bytes in buffer
   // TASK 1: stream abort flag
   private streamAborted: boolean = false;
+
+  // Staging buffer for base codes (unchanged)
+  private stagingBuffer: Uint8Array = new Uint8Array(65536);
+  private stagingIndex: number = 0;
 
   // ---------- Sentinel Threat Screening ----------
   private screeningEngine: ScreeningEngine = new ScreeningEngine();
@@ -220,6 +263,9 @@ class ArkheEngine {
       this.syntenyTaskId = null;
     }
 
+    // TASK 4: clear synteny scan state
+    this.syntenyScanState = null;
+
     this.sentinelCache = null;
     this.sentinelLastGenomeLength = 0;
     this.orfCache = null;
@@ -228,10 +274,11 @@ class ArkheEngine {
     this.offTargetCache.clear();
     this.editedSlabs.clear();
 
-    // TASK 1: Reset stream state
-    this.streamBuffer = '';
-    this.stagingIndex = 0;
+    // TASK 1: Reset byte stream state
+    this.streamByteBuffer = new Uint8Array(65536);
+    this.streamByteLength = 0;
     this.streamAborted = false;
+    this.stagingIndex = 0;
 
     this.slabManager = new SlabManager(this.useSharedBuffers, expectedFileSize);
 
@@ -274,7 +321,7 @@ class ArkheEngine {
     return matches;
   }
 
-  // --- ORF Autopilot ---
+  // --- ORF Autopilot (now async) ---
   private scheduleORFScan() {
     if (typeof self.requestIdleCallback === 'function') {
       this.orfTaskId = self.requestIdleCallback(
@@ -286,7 +333,7 @@ class ArkheEngine {
     }
   }
 
-  private performORFScan(deadline?: IdleDeadline): void {
+  private async performORFScan(deadline?: IdleDeadline): Promise<void> {
     const currentTaskId = this.getCurrentTaskId();
     const genomeLength = this.slabManager.getGenomeLength();
     if (genomeLength === 0) {
@@ -310,7 +357,7 @@ class ArkheEngine {
     if (this.activeTaskId !== currentTaskId) return;
 
     const region = this.slabManager.readRegion(start, end);
-    const orfs = this.bioLogic.detectORFs(region, ORF_MIN_AA_LENGTH);
+    const orfs = await this.bioLogic.detectORFs(region, ORF_MIN_AA_LENGTH);
 
     const globalORFs = orfs.map(orf => ({
       ...orf,
@@ -369,26 +416,69 @@ class ArkheEngine {
     );
   }
 
-  // --- Auto‑Annotator with TASK 2 Circuit Breaker ---
+  // --- Auto‑Annotator with TASK 2 chunking (LB-07) ---
   async autoAnnotateGenome(): Promise<FeatureTag[]> {
     const genomeLength = this.slabManager.getGenomeLength();
     if (genomeLength === 0) return [];
 
-    // TASK 2: 500 million base guard
+    // TASK 2: 500 million base guard (kept from earlier)
     if (genomeLength > 500_000_000) {
       logToUI('ANNOTATION', 'Genome exceeds 500Mb; full auto‑annotation disabled. Use on‑demand region analysis.', 'warning');
       return [];
     }
 
-    const region = this.slabManager.readRegion(0, genomeLength - 1);
-    const features = this.bioLogic.autoAnnotate(region, ORF_MIN_AA_LENGTH);
+    const features: FeatureTag[] = [];
+    const chunkSize = AUTO_ANNOTATE_CHUNK_SIZE;
+    const overlap = AUTO_ANNOTATE_OVERLAP;
 
-    for (const feat of features) {
+    for (let start = 0; start < genomeLength; start += chunkSize) {
+      // Ensure overlap on both sides, but clamp to genome bounds
+      const chunkStart = Math.max(0, start - overlap);
+      const chunkEnd = Math.min(genomeLength - 1, start + chunkSize + overlap - 1);
+      const region = this.slabManager.readRegion(chunkStart, chunkEnd);
+
+      // Auto‑annotate this chunk
+      const chunkFeatures = await this.bioLogic.autoAnnotate(region, ORF_MIN_AA_LENGTH);
+
+      // Convert global coordinates and push
+      for (const f of chunkFeatures) {
+        const globalFeat: FeatureTag = {
+          id: `auto-${Date.now()}-${Math.random().toString(36)}`, // generate unique id
+          name: f.name,
+          type: f.type,
+          start: chunkStart + f.start,
+          end: chunkStart + f.end,
+          strand: f.strand,
+          attributes: f.attributes,
+        };
+        features.push(globalFeat);
+      }
+
+      // (Optional) yield to event loop for large genomes
+      if (genomeLength > 100_000_000) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+
+    // Simple deduplication: if two features overlap > 90%, keep only one
+    const uniqueFeatures: FeatureTag[] = [];
+    for (const f of features) {
+      const duplicate = uniqueFeatures.some(existing =>
+        existing.name === f.name &&
+        Math.abs(existing.start - f.start) < 100 &&
+        Math.abs(existing.end - f.end) < 100
+      );
+      if (!duplicate) {
+        uniqueFeatures.push(f);
+      }
+    }
+
+    for (const feat of uniqueFeatures) {
       this.slabManager.addFeature(feat);
     }
 
-    logToUI('ANNOTATION', `Auto‑annotated ${features.length} high‑confidence genes`, features.length ? 'success' : 'info');
-    return features;
+    logToUI('ANNOTATION', `Auto‑annotated ${uniqueFeatures.length} high‑confidence genes (chunked)`, uniqueFeatures.length ? 'success' : 'info');
+    return uniqueFeatures;
   }
 
   // --- Sentinel Scan ---
@@ -475,15 +565,15 @@ class ArkheEngine {
     return this.sentinelCache;
   }
 
-  // --- Restriction Enzyme Finder ---
-  findRestrictionSites(
+  // --- Restriction Enzyme Finder (async) ---
+  async findRestrictionSites(
     start: number,
     end: number,
     enzymeList?: string[]
-  ): RestrictionCutSite[] {
+  ): Promise<RestrictionCutSite[]> {
     const region = this.slabManager.readRegion(start, end);
     const seq = Array.from(region).map(b => ['A','C','G','T','N'][b]).join('');
-    const sites = this.bioLogic.findRestrictionSites(seq, enzymeList);
+    const sites = await this.bioLogic.findRestrictionSites(seq, enzymeList);
 
     const absoluteSites = sites.map(site => ({
       ...site,
@@ -635,8 +725,12 @@ class ArkheEngine {
     }
   }
 
-  // --- Synteny Ghosting ---
+  // --- Synteny Ghosting (TASK 4: Refactored with yielding) ---
   private scheduleSyntenyScan(): void {
+    // If there's already a scan in progress (state not null and not done), don't start another.
+    if (this.syntenyScanState && this.syntenyScanState.step !== 'done') {
+      return;
+    }
     if (typeof self.requestIdleCallback === 'function') {
       this.syntenyTaskId = self.requestIdleCallback(
         (deadline) => this.scanStructuralVariants(deadline),
@@ -661,67 +755,213 @@ class ArkheEngine {
     return hash;
   }
 
+  /**
+   * TASK 4: Refactored to yield control every YIELD_INTERVAL_MS or YIELD_ITERATION_COUNT.
+   * Aborts if total scan time exceeds MAX_SCAN_TIME_MS.
+   */
   public scanStructuralVariants(deadline?: IdleDeadline): void {
     const currentTaskId = this.getCurrentTaskId();
-    const startTime = performance.now();
     const genomeLength = this.slabManager.getGenomeLength();
-    if (genomeLength < REPEAT_MIN_LENGTH * 2) return;
 
-    const anchors: SyntenyAnchor[] = [];
+    // Guard: not enough sequence
+    if (genomeLength < REPEAT_MIN_LENGTH * 2) {
+      this.syntenyAnchors = [];
+      postMessage({ type: 'SYNTENY_ANCHORS', payload: [] });
+      this.syntenyScanState = null;
+      return;
+    }
+
+    // Initialize state if this is the first call for this scan
+    if (!this.syntenyScanState) {
+      const region = this.slabManager.readRegion(0, genomeLength - 1);
+      const rcRegion = this.reverseComplement(region);
+      const windowSize = REPEAT_MIN_LENGTH;
+
+      // Build rolling hash map for direct repeats
+      const hashMap = new Map<number, number[]>();
+      let hash = this.computeRollingHash(region, 0, windowSize);
+      hashMap.set(hash, [0]);
+
+      for (let i = 1; i <= region.length - windowSize; i++) {
+        hash = this.updateRollingHash(hash, region[i - 1], region[i + windowSize - 1], windowSize);
+        const positions = hashMap.get(hash) || [];
+        positions.push(i);
+        hashMap.set(hash, positions);
+      }
+
+      this.syntenyScanState = {
+        step: 'direct',
+        hashMap,
+        rcRegion,
+        keys: Array.from(hashMap.keys()),
+        keyIndex: 0,
+        positions: [],
+        i: 0,
+        j: 0,
+        anchors: [],
+        startTime: performance.now(),
+        lastYieldTime: performance.now(),
+        iterationsSinceYield: 0,
+        aborted: false,
+      };
+    }
+
+    const state = this.syntenyScanState;
+    // If already aborted, clean up and exit
+    if (state.aborted) {
+      this.syntenyScanState = null;
+      return;
+    }
+
+    const now = performance.now();
+    const totalElapsed = now - state.startTime;
+    if (totalElapsed > MAX_SCAN_TIME_MS) {
+      logToUI('GHOST', `Synteny scan aborted after ${totalElapsed.toFixed(0)}ms (>${MAX_SCAN_TIME_MS}ms)`, 'error');
+      state.aborted = true;
+      this.syntenyScanState = null;
+      return;
+    }
+
+    // Helper to check if we should yield
+    const shouldYield = (): boolean => {
+      if (!deadline) {
+        // Safari Fallback: yield every 50ms of real time
+        const now = performance.now();
+        if (state.lastYieldTime === undefined) state.lastYieldTime = now;
+        return (now - state.lastYieldTime) > 50; 
+      }
+      if (deadline.timeRemaining() < 2) return true;
+      const timeSinceLastYield = performance.now() - state.lastYieldTime;
+      return timeSinceLastYield > YIELD_INTERVAL_MS || state.iterationsSinceYield > YIELD_ITERATION_COUNT;
+    };
+
+    // Process work in chunks, yielding as needed
+    let workDone = false;
+
+    while (!workDone && !shouldYield()) {
+      if (state.step === 'direct') {
+        workDone = this.processDirectRepeatsChunk(state);
+      } else if (state.step === 'inverted') {
+        workDone = this.processInvertedRepeatsChunk(state);
+      } else if (state.step === 'done') {
+        break;
+      }
+      state.iterationsSinceYield++;
+    }
+
+    // Update yield timer if we yielded
+    if (shouldYield() && !workDone) {
+      state.lastYieldTime = performance.now();
+      state.iterationsSinceYield = 0;
+    }
+
+    if (workDone && state.step === 'done') {
+      // Scan finished successfully
+      this.syntenyAnchors = state.anchors;
+      postMessage({ type: 'SYNTENY_ANCHORS', payload: state.anchors });
+
+      const elapsed = performance.now() - state.startTime;
+      const directCount = state.anchors.filter(a => a.type === 'direct_repeat').length;
+      const invertedCount = state.anchors.filter(a => a.type === 'inverted_repeat').length;
+      logToUI('GHOST', `Synteny scan completed in ${elapsed.toFixed(0)}ms – ${directCount} direct, ${invertedCount} inverted repeats`, 'success');
+      if (directCount + invertedCount > 0) {
+        const slabHits = new Set<number>();
+        state.anchors.forEach(a => {
+          slabHits.add(Math.floor(a.startA / SLAB_SIZE));
+          slabHits.add(Math.floor(a.startB / SLAB_SIZE));
+        });
+        logToUI('GHOST', `Found ${slabHits.size} slabs with structural variants`, 'info');
+      }
+
+      this.syntenyScanState = null; // clear state
+    } else {
+      // Not done yet, reschedule
+      this.scheduleSyntenyScan();
+    }
+  }
+
+  /**
+   * Process one unit of direct repeat detection.
+   * Returns true when the direct repeat phase is complete.
+   */
+  private processDirectRepeatsChunk(state: SyntenyScanState): boolean {
+    const { hashMap, keys } = state;
+
+    // If we've processed all keys, move to inverted phase
+    if (state.keyIndex >= keys.length) {
+      state.step = 'inverted';
+      state.keyIndex = 0;
+      state.i = 0;
+      state.j = 0;
+      return false; // not done overall, but direct phase finished
+    }
+
+    const key = keys[state.keyIndex];
+    const positions = hashMap.get(key)!;
+
+    // If we haven't started this key's positions, set up
+    if (state.positions !== positions) {
+      state.positions = positions;
+      state.i = 0;
+      state.j = 1;
+    }
+
+    // Process pairs for this key
+    const positionsLen = positions.length;
+    while (state.i < positionsLen && state.j < positionsLen) {
+      // Create an anchor for each pair (i < j)
+      state.anchors.push({
+        type: 'direct_repeat',
+        startA: positions[state.i],
+        endA: positions[state.i] + REPEAT_MIN_LENGTH - 1,
+        startB: positions[state.j],
+        endB: positions[state.j] + REPEAT_MIN_LENGTH - 1,
+        identity: 1.0,
+        length: REPEAT_MIN_LENGTH,
+      });
+
+      // Move to next pair
+      state.j++;
+      if (state.j >= positionsLen) {
+        state.i++;
+        state.j = state.i + 1;
+      }
+      state.iterationsSinceYield++;
+
+      // DOOMSDAY PATCH: Break the synchronous black hole
+      if (state.iterationsSinceYield > YIELD_ITERATION_COUNT) {
+        return false; // Yield control back to the outer loop
+      }
+    }
+
+    // Move to next key
+    state.keyIndex++;
+    return false; // not done overall
+  }
+
+  /**
+   * Process one unit of inverted repeat detection.
+   * Returns true when the inverted repeat phase is complete.
+   */
+  private processInvertedRepeatsChunk(state: SyntenyScanState): boolean {
     const windowSize = REPEAT_MIN_LENGTH;
-    const hashMap = new Map<number, number[]>();
+    const region = this.slabManager.readRegion(0, this.slabManager.getGenomeLength() - 1);
+    const rcRegion = state.rcRegion;
 
-    const region = this.slabManager.readRegion(0, genomeLength - 1);
-    let hash = this.computeRollingHash(region, 0, windowSize);
-    hashMap.set(hash, [0]);
+    // Outer loop: i over forward positions
+    while (state.i <= region.length - windowSize) {
+      const i = state.i;
 
-    for (let i = 1; i <= region.length - windowSize; i++) {
-      if (this.activeTaskId !== currentTaskId) return;
+      // Inner loop: j over reverse complement positions
+      while (state.j <= rcRegion.length - windowSize) {
+        const j = state.j;
 
-      if (deadline && deadline.timeRemaining() < 2) {
-        this.scheduleSyntenyScan();
-        this.syntenyAnchors = anchors;
-        postMessage({ type: 'SYNTENY_ANCHORS', payload: anchors });
-        return;
-      }
-      hash = this.updateRollingHash(hash, region[i - 1], region[i + windowSize - 1], windowSize);
-      const positions = hashMap.get(hash) || [];
-      positions.push(i);
-      hashMap.set(hash, positions);
-    }
-
-    let directCount = 0, invertedCount = 0;
-
-    for (const [, positions] of hashMap.entries()) {
-      if (this.activeTaskId !== currentTaskId) return;
-
-      if (positions.length > 1) {
-        for (let i = 0; i < positions.length; i++) {
-          for (let j = i + 1; j < positions.length; j++) {
-            anchors.push({
-              type: 'direct_repeat',
-              startA: positions[i],
-              endA: positions[i] + windowSize - 1,
-              startB: positions[j],
-              endB: positions[j] + windowSize - 1,
-              identity: 1.0,
-              length: windowSize,
-            });
-            directCount++;
-          }
-        }
-      }
-    }
-
-    const rcRegion = this.reverseComplement(region);
-    for (let i = 0; i <= region.length - windowSize; i++) {
-      if (this.activeTaskId !== currentTaskId) return;
-      if (deadline && deadline.timeRemaining() < 2) break;
-
-      const fwdHash = this.computeRollingHash(region, i, windowSize);
-      for (let j = 0; j <= rcRegion.length - windowSize; j++) {
+        // Compare forward hash with reverse hash
+        const fwdHash = this.computeRollingHash(region, i, windowSize);
         const rcHash = this.computeRollingHash(rcRegion, j, windowSize);
+
         if (fwdHash === rcHash) {
+          // Verify full match (avoid hash collisions)
           let match = true;
           for (let k = 0; k < windowSize; k++) {
             if (region[i + k] !== rcRegion[j + k]) {
@@ -730,34 +970,43 @@ class ArkheEngine {
             }
           }
           if (match) {
-            anchors.push({
+            state.anchors.push({
               type: 'inverted_repeat',
               startA: i,
               endA: i + windowSize - 1,
-              startB: genomeLength - 1 - (j + windowSize - 1),
-              endB: genomeLength - 1 - j,
+              startB: region.length - 1 - (j + windowSize - 1),
+              endB: region.length - 1 - j,
               identity: 1.0,
               length: windowSize,
             });
-            invertedCount++;
           }
         }
+
+        state.j++;
+        state.iterationsSinceYield++;
+
+        // DOOMSDAY PATCH: Break the synchronous black hole
+        if (state.iterationsSinceYield > YIELD_ITERATION_COUNT) {
+          return false; // Yield control back to the outer loop
+        }
+      }
+
+      // Reset inner loop, advance outer
+      state.i++;
+      state.j = 0;
+
+      // DOOMSDAY PATCH: Break the synchronous black hole
+      if (state.iterationsSinceYield > YIELD_ITERATION_COUNT) {
+        return false; // Yield control back to the outer loop
       }
     }
 
-    this.syntenyAnchors = anchors;
-    postMessage({ type: 'SYNTENY_ANCHORS', payload: anchors });
-
-    const elapsed = performance.now() - startTime;
-    logToUI('GHOST', `Synteny scan completed in ${elapsed.toFixed(0)}ms – ${directCount} direct, ${invertedCount} inverted repeats`, 'success');
-    if (directCount + invertedCount > 0) {
-      const slabHits = new Set<number>();
-      anchors.forEach(a => {
-        slabHits.add(Math.floor(a.startA / SLAB_SIZE));
-        slabHits.add(Math.floor(a.startB / SLAB_SIZE));
-      });
-      logToUI('GHOST', `Found ${slabHits.size} slabs with structural variants`, 'info');
+    // If we've exhausted all i, we're done
+    if (state.i > region.length - windowSize) {
+      state.step = 'done';
+      return true;
     }
+    return false;
   }
 
   getSyntenyAnchors(): SyntenyAnchor[] {
@@ -765,17 +1014,19 @@ class ArkheEngine {
   }
 
   refreshSyntenyScan(): SyntenyAnchor[] {
+    // Abort any ongoing scan and start fresh
+    this.syntenyScanState = null;
     this.syntenyAnchors = [];
     this.scanStructuralVariants();
     return this.syntenyAnchors;
   }
 
-  // --- Splice & Isoform Oracle ---
-  predictSpliceSites(buffer: Uint8Array, strand: '+' | '-' = '+'): SpliceSite[] {
+  // --- Splice & Isoform Oracle (async) ---
+  async predictSpliceSites(buffer: Uint8Array, strand: '+' | '-' = '+'): Promise<SpliceSite[]> {
     return this.bioLogic.predictSpliceSites(buffer, strand);
   }
 
-  predictIsoforms(buffer: Uint8Array, orf: ORF, spliceSites: SpliceSite[]): SpliceIsoform[] {
+  async predictIsoforms(buffer: Uint8Array, orf: ORF, spliceSites: SpliceSite[]): Promise<SpliceIsoform[]> {
     return this.bioLogic.predictIsoforms(buffer, orf, spliceSites);
   }
 
@@ -929,9 +1180,9 @@ class ArkheEngine {
     return overlap;
   }
 
-  // --- Hairpin Sentinel ---
-  detectHairpins(sequence: string): HairpinPrediction[] {
-    const hairpins = this.bioLogic.detectHairpins(sequence);
+  // --- Hairpin Sentinel (async) ---
+  async detectHairpins(sequence: string): Promise<HairpinPrediction[]> {
+    const hairpins = await this.bioLogic.detectHairpins(sequence);
     if (hairpins.length > 0) {
       const critical = hairpins.filter(h => h.critical);
       logToUI('STRUCTURE', `Detected ${hairpins.length} hairpins, ${critical.length} critical (ΔG < -5 kcal/mol)`, critical.length ? 'error' : 'info');
@@ -964,6 +1215,25 @@ class ArkheEngine {
   }
 
   // --- Streaming (FASTA-aware with TASK 1 guard) ---
+
+  /**
+   * Process a single line (as a Uint8Array) by converting to string and
+   * feeding into processSequenceLine.
+   */
+  private processLineBytes(lineBytes: Uint8Array): void {
+    // Convert to ASCII string – safe because FASTA lines are ASCII.
+    // Use TextDecoder for efficiency.
+    const decoder = new TextDecoder('ascii');
+    const line = decoder.decode(lineBytes);
+    // Skip header lines (start with '>')
+    if (line.startsWith('>')) return;
+    this.processSequenceLine(line);
+  }
+
+  /**
+   * Process a line string (already stripped of newline) by iterating characters
+   * and appending base codes to stagingBuffer.
+   */
   private processSequenceLine(line: string): void {
     for (let i = 0; i < line.length; i++) {
       const ch = line[i].toUpperCase();
@@ -980,41 +1250,98 @@ class ArkheEngine {
     }
   }
 
+  /**
+   * Ensures the streamByteBuffer has enough capacity for at least `needed` bytes.
+   * Grows exponentially (factor 2) to avoid frequent reallocation.
+   */
+  private ensureStreamBufferCapacity(needed: number): void {
+    if (this.streamByteBuffer.length - this.streamByteLength >= needed) return;
+    // Double the size until it fits
+    let newSize = this.streamByteBuffer.length;
+    while (newSize - this.streamByteLength < needed) {
+      newSize *= 2;
+    }
+    const newBuffer = new Uint8Array(newSize);
+    newBuffer.set(this.streamByteBuffer.subarray(0, this.streamByteLength));
+    this.streamByteBuffer = newBuffer;
+  }
+
+  /**
+   * handleStreamChunk – TASK 1 (LB-03/12) refactored.
+   *
+   * Now uses a byte accumulator to avoid massive string concatenations.
+   * Scans for newline characters and processes complete lines.
+   * Also checks total allocated memory against HARD_MEMORY_LIMIT.
+   */
   handleStreamChunk(payload: { fileId: string; chunkBuffer: ArrayBuffer; byteOffset: number }): { processed: number } | void {
-    // TASK 1: If stream already aborted, ignore further chunks
+    // If stream already aborted, ignore further chunks
     if (this.streamAborted) {
       return { processed: 0 };
     }
 
-    const bytes = new Uint8Array(payload.chunkBuffer);
-    const decoder = new TextDecoder('utf-8');
-    const text = decoder.decode(bytes);
-
-    this.streamBuffer += text;
-
-    // TASK 1: Check for excessive buffer without newline
-    if (this.streamBuffer.length > MAX_BUFFER_SIZE && !this.streamBuffer.includes('\n')) {
+    // Check total allocated memory before processing this chunk
+    const totalAllocated = this.slabManager.getTotalAllocatedBytes();
+    if (totalAllocated > HARD_MEMORY_LIMIT) {
       this.streamAborted = true;
-      this.streamBuffer = '';   // clear to free memory
-      // Post error message
+      this.streamByteLength = 0; // free buffer
+      postMessage({
+        type: 'ERROR',
+        payload: { message: 'OUT_OF_MEMORY_PROTECTION: Total slab allocation exceeded 512MB' }
+      });
+      logToUI('WORKER', 'Stream aborted: memory limit exceeded', 'error');
+      return { processed: 0 };
+    }
+
+    const bytes = new Uint8Array(payload.chunkBuffer);
+    // Ensure we have room for the new bytes
+    this.ensureStreamBufferCapacity(bytes.length);
+    // Append to streamByteBuffer
+    this.streamByteBuffer.set(bytes, this.streamByteLength);
+    this.streamByteLength += bytes.length;
+
+    // Scan for newlines (ASCII 10) from the beginning of the buffer
+    let processedBytes = 0;
+    let lineStart = 0;
+    for (let i = 0; i < this.streamByteLength; i++) {
+      if (this.streamByteBuffer[i] === 10) { // newline
+        // Extract line (excluding newline)
+        const lineBytes = this.streamByteBuffer.subarray(lineStart, i);
+        if (lineBytes.length > MAX_BUFFER_SIZE) {
+          // Line too long – abort
+          this.streamAborted = true;
+          this.streamByteLength = 0;
+          postMessage({
+            type: 'ERROR',
+            payload: { message: 'MALFORMED_FASTA_LINE_TOO_LONG' }
+          });
+          logToUI('WORKER', 'Stream aborted: line exceeds 50MB without newline', 'error');
+          return { processed: 0 };
+        }
+        this.processLineBytes(lineBytes);
+        lineStart = i + 1;
+        processedBytes = i + 1; // mark processed up to this newline
+      }
+    }
+
+    if (processedBytes > 0) {
+      // Remove processed bytes from buffer by shifting remaining data to front
+      const remaining = this.streamByteLength - processedBytes;
+      if (remaining > 0) {
+        this.streamByteBuffer.copyWithin(0, processedBytes, this.streamByteLength);
+      }
+      this.streamByteLength = remaining;
+    }
+
+    // If no newline found and buffer size exceeds MAX_BUFFER_SIZE, it's a single line too long
+    if (lineStart === 0 && this.streamByteLength > MAX_BUFFER_SIZE) {
+      this.streamAborted = true;
+      this.streamByteLength = 0;
       postMessage({
         type: 'ERROR',
         payload: { message: 'MALFORMED_FASTA_LINE_TOO_LONG' }
       });
       logToUI('WORKER', 'Stream aborted: line exceeds 50MB without newline', 'error');
       return { processed: 0 };
-    }
-
-    let newlineIndex;
-    while ((newlineIndex = this.streamBuffer.indexOf('\n')) !== -1) {
-      const line = this.streamBuffer.slice(0, newlineIndex);
-      this.streamBuffer = this.streamBuffer.slice(newlineIndex + 1);
-
-      if (line.startsWith('>')) {
-        continue;
-      }
-
-      this.processSequenceLine(line);
     }
 
     return { processed: bytes.byteLength };
@@ -1025,11 +1352,15 @@ class ArkheEngine {
       logToUI('WORKER', 'Finalize called on aborted stream – ignoring', 'warning');
       return;
     }
-    if (this.streamBuffer.length > 0) {
-      if (!this.streamBuffer.startsWith('>')) {
-        this.processSequenceLine(this.streamBuffer);
+    // Process any remaining bytes as the last line (if not a header)
+    if (this.streamByteLength > 0) {
+      const lastLine = this.streamByteBuffer.subarray(0, this.streamByteLength);
+      const decoder = new TextDecoder('ascii');
+      const line = decoder.decode(lastLine);
+      if (!line.startsWith('>')) {
+        this.processSequenceLine(line);
       }
-      this.streamBuffer = '';
+      this.streamByteLength = 0;
     }
 
     if (this.stagingIndex > 0) {
@@ -1040,8 +1371,8 @@ class ArkheEngine {
     logToUI('WORKER', 'Stream finalized, staging buffer flushed', 'info');
   }
 
-  // --- Load Slice with TASK 3 cancellation support ---
-  loadSlice(payload: { start: number; end: number }, requestId: number): SliceResponse | null {
+  // --- Load Slice with TASK 3 cancellation support (async) ---
+  async loadSlice(payload: { start: number; end: number }, requestId: number): Promise<SliceResponse | null> {
     // TASK 3: Discard if this request is no longer the latest
     if (requestId !== this.latestViewportRequestId) {
       return null;
@@ -1060,7 +1391,7 @@ class ArkheEngine {
     const gcPercent = this.bioLogic.computeGCContent(data);
     const features = this.slabManager.getFeaturesInRange(payload.start, safeEnd);
     const orfs = this.getORFsInRange(payload.start, safeEnd);
-    const spliceSites = this.bioLogic.predictSpliceSites(data);
+    const spliceSites = await this.bioLogic.predictSpliceSites(data);
     let proteinProperties: ProteinProperties | undefined;
     let isoforms: SpliceIsoform[] | undefined;
 
@@ -1068,7 +1399,7 @@ class ArkheEngine {
       const longestORF = orfs.reduce((a, b) => (a.end - a.start > b.end - b.start ? a : b));
       const aaSeq = longestORF.aaSequence.slice(0, -1);
       proteinProperties = this.bioLogic.getProteinProperties(aaSeq);
-      isoforms = this.bioLogic.predictIsoforms(data, longestORF, spliceSites);
+      isoforms = await this.bioLogic.predictIsoforms(data, longestORF, spliceSites);
     }
 
     // Final check before returning
@@ -1532,7 +1863,7 @@ class ArkheEngine {
   }
 }
 
-// ---------- Worker Message Handling with TASK 3 Cancellation ----------
+// ---------- Worker Message Handling (updated for async) ----------
 const engine = new ArkheEngine();
 
 self.onmessage = async (e: MessageEvent) => {
@@ -1574,14 +1905,11 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
       case 'LOAD_SLICE': {
-        // TASK 3: Obtain a fresh request ID from the engine
         const requestId = engine.getNextRequestId();
-        const result = engine.loadSlice(payload, requestId);
+        const result = await engine.loadSlice(payload, requestId);
         if (result) {
-          // Only post if this request is still the latest (result not null)
           postMessage({ type: 'SLICE', id, payload: result }, [result.buffer]);
         } else {
-          // Optionally send a cancellation notice (not required, but can help debugging)
           postMessage({ type: 'SLICE_CANCELLED', id, payload: { reason: 'superseded' } });
         }
         break;
@@ -1729,13 +2057,13 @@ self.onmessage = async (e: MessageEvent) => {
       }
       case 'PREDICT_SPLICE_SITES': {
         const region = engine.slabManager.readRegion(payload.start, payload.end);
-        const sites = engine.predictSpliceSites(region, payload.strand);
+        const sites = await engine.predictSpliceSites(region, payload.strand);
         postMessage({ type: 'PREDICT_SPLICE_SITES_RESULT', id, payload: sites });
         break;
       }
       case 'PREDICT_ISOFORMS': {
         const region = engine.slabManager.readRegion(payload.start, payload.end);
-        const isoforms = engine.predictIsoforms(region, payload.orf, payload.spliceSites);
+        const isoforms = await engine.predictIsoforms(region, payload.orf, payload.spliceSites);
         postMessage({ type: 'PREDICT_ISOFORMS_RESULT', id, payload: isoforms });
         break;
       }
@@ -1766,7 +2094,7 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
       case 'DETECT_HAIRPINS': {
-        const hairpins = engine.detectHairpins(payload.sequence);
+        const hairpins = await engine.detectHairpins(payload.sequence);
         postMessage({ type: 'DETECT_HAIRPINS_RESULT', id, payload: hairpins });
         break;
       }
@@ -1783,7 +2111,7 @@ self.onmessage = async (e: MessageEvent) => {
         break;
       }
       case 'FIND_RESTRICTION_SITES': {
-        const sites = engine.findRestrictionSites(payload.start, payload.end, payload.enzymes);
+        const sites = await engine.findRestrictionSites(payload.start, payload.end, payload.enzymes);
         postMessage({ type: 'FIND_RESTRICTION_SITES_RESULT', id, payload: sites });
         break;
       }
