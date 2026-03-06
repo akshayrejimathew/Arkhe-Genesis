@@ -1,35 +1,4 @@
-/**
- * ArkheEngine.worker.ts
- * High-performance genomic editing engine – FULL SPECTRUM.
- *
- * SPRINT 6 FIXES (2026-02-25):
- *
- *   TASK 1 — Unbounded streamBuffer Guard (LB-03 / LB-12):
- *     • `handleStreamChunk()` now uses a byte accumulator (Uint8Array) instead
- *       of string concatenation, eliminating 100MB transient spikes.
- *     • Checks total allocated memory via SlabManager.getTotalAllocatedBytes()
- *       against a hard limit (512 MB). If exceeded, aborts with
- *       `OUT_OF_MEMORY_PROTECTION` error.
- *
- *   TASK 2 — 250MB OOM in autoAnnotateGenome (LB-07):
- *     `autoAnnotateGenome()` now processes the genome in 10MB chunks with a
- *     10kb overlap to capture cross‑boundary features. Duplicate features are
- *     deduplicated by approximate overlap merging.
- *
- *   TASK 3 — Request Cancellation Logic (re‑enforced):
- *     Viewport requests (LOAD_SLICE) already carried a request ID; only the most
- *     recent request is processed. Older requests are discarded.
- *
- *   TASK 4 — Refactor O(N²) loops in scanStructuralVariants (Heuristic Wall):
- *     • Introduced a yielding loop pattern: every 50ms (or 5000 iterations) we
- *       check elapsed time and yield back to the event loop.
- *     • If the total execution time exceeds 2 seconds for a single scan, the
- *       scan is aborted and a warning is logged.
- *     • The scan now processes direct and inverted repeats in incremental
- *       chunks, storing intermediate state in `syntenyScanState`.
- *
- * PREVIOUS FIXES (SPRINT 5, SHADOW-NEW-01, SHADOW-02, etc.) are preserved.
- */
+
 
 /// <reference lib="webworker" />
 
@@ -105,6 +74,9 @@ const HARD_MEMORY_LIMIT = 512 * 1024 * 1024; // 512MB
 const AUTO_ANNOTATE_CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
 const AUTO_ANNOTATE_OVERLAP = 10 * 1024; // 10kb overlap to catch boundary features
 
+// ---------- TASK 2 (Sentinel): Overlap for threat scanning ----------
+const KMER_SIZE = 24;  // must match ScreeningEngine's constant
+
 // ---------- Telemetry Logger (with Debug Mode) ----------
 let DEBUG_MODE = false;
 
@@ -163,6 +135,9 @@ class ArkheEngine {
   // Zombie transition prevention
   private activeTaskId: string | null = null;
   private taskCounter = 0;
+  
+  // TASK: Worker Task Cancellation - currentTaskId for killing Ghost Tasks
+  private currentTaskId: number = 0;
 
   private sentinelCache: SentinelSummary | null = null;
   private sentinelTaskId: number | null = null;
@@ -241,6 +216,9 @@ class ArkheEngine {
   resetEngine(expectedFileSize?: number): void {
     this.taskCounter++;
     this.activeTaskId = `task-${this.taskCounter}-${Date.now()}`;
+    
+    // TASK: Increment currentTaskId for new task
+    this.currentTaskId++;
 
     if (this.sentinelTaskId) {
       if (typeof self.cancelIdleCallback === 'function') {
@@ -308,13 +286,25 @@ class ArkheEngine {
     logToUI('SENTINEL', `Threat library v${lib.version} loaded (${lib.signatures.size} signatures)`, 'success');
   }
 
-  // --- Threat Screening ---
+  // --- Threat Screening with Overlap (TASK 2) ---
   screenThreats(sequence: string, start?: number, end?: number): ThreatMatch[] {
     if (!this.screeningEngine.isLoaded()) {
       logToUI('SENTINEL', 'Threat screening attempted but no library loaded', 'warning');
       return [];
     }
-    const matches = this.screeningEngine.scan(sequence, start, end);
+
+    // Extend the region to include (KMER_SIZE-1) bases from the left to catch boundary‑crossing threats.
+    const effectiveStart = Math.max(0, (start ?? 0) - (KMER_SIZE - 1));
+    const effectiveEnd = end ?? sequence.length - 1;
+    const extendedSeq = sequence.slice(effectiveStart, effectiveEnd + 1);
+
+    const matches = this.screeningEngine.scan(
+      extendedSeq,
+      0,
+      undefined,
+      effectiveStart  // globalStart: the original start coordinate
+    );
+
     if (matches.length > 0) {
       logToUI('SENTINEL', `Found ${matches.length} threat signatures`, 'warning');
     }
@@ -1272,6 +1262,9 @@ class ArkheEngine {
    * Now uses a byte accumulator to avoid massive string concatenations.
    * Scans for newline characters and processes complete lines.
    * Also checks total allocated memory against HARD_MEMORY_LIMIT.
+   *
+   * After processing, if remaining data <25% of buffer capacity, the buffer
+   * is shrunk to free memory.
    */
   handleStreamChunk(payload: { fileId: string; chunkBuffer: ArrayBuffer; byteOffset: number }): { processed: number } | void {
     // If stream already aborted, ignore further chunks
@@ -1342,6 +1335,18 @@ class ArkheEngine {
       });
       logToUI('WORKER', 'Stream aborted: line exceeds 50MB without newline', 'error');
       return { processed: 0 };
+    }
+
+    // --- TASK 3: Shrink buffer if remaining data <25% of capacity ---
+    const capacity = this.streamByteBuffer.length;
+    if (this.streamByteLength > 0 && this.streamByteLength < capacity * 0.25) {
+      // Shrink to the next power of two >= streamByteLength
+      let newSize = 64; // minimum
+      while (newSize < this.streamByteLength) newSize *= 2;
+      const newBuffer = new Uint8Array(newSize);
+      newBuffer.set(this.streamByteBuffer.subarray(0, this.streamByteLength));
+      this.streamByteBuffer = newBuffer;
+      logToUI('MEMORY', `Stream buffer shrunk from ${capacity} to ${newSize} bytes`, 'info', true);
     }
 
     return { processed: bytes.byteLength };
@@ -1851,7 +1856,35 @@ class ArkheEngine {
 
       const start = slabIdx * SLAB_SIZE;
       const end = start + slabLength - 1;
-      fastaContent += `>edited_slab_${slabIdx} | coordinates: ${start}-${end}\n`;
+
+      // ── SPRINT 2 FIX (TASK 5) — FASTA Header Sanitization ────────────────
+      //
+      // FASTA headers are parsed by downstream legacy bioinformatics tools
+      // (BWA, SAMtools, Bowtie2, shell pipelines) using whitespace and special
+      // characters as field delimiters or as shell metacharacters. If a slab
+      // coordinate or genome name contains `;`, `|`, or `&`, it can:
+      //
+      //   • `|`  — split the header in tools that use `|` as a record separator
+      //             (e.g. NCBI-style compound IDs in BLAST databases).
+      //   • `;`  — terminate a shell command when the FASTA is piped to a
+      //             legacy tool that constructs shell commands from header fields.
+      //   • `&`  — background a subcommand in shell pipelines, enabling
+      //             command injection if the header is used in a shell context.
+      //
+      // We strip all three from any value that is interpolated into the header
+      // line. The coordinate values are numeric and cannot contain these chars,
+      // but we sanitize them defensively anyway.
+      //
+      // A general-purpose sanitizer is defined here as a local helper so it
+      // can be applied to any future header fields added in later sprints.
+      const sanitizeFastaHeaderField = (value: string): string =>
+        value.replace(/[;|&]/g, '_');
+
+      const safeSlabIdx = sanitizeFastaHeaderField(String(slabIdx));
+      const safeStart   = sanitizeFastaHeaderField(String(start));
+      const safeEnd     = sanitizeFastaHeaderField(String(end));
+
+      fastaContent += `>edited_slab_${safeSlabIdx} | coordinates: ${safeStart}-${safeEnd}\n`;
       for (let i = 0; i < sequence.length; i += 80) {
         fastaContent += sequence.slice(i, i + 80) + '\n';
       }
@@ -1863,11 +1896,105 @@ class ArkheEngine {
   }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SPRINT 1 FIX — TASK 4: Worker Bounds-Check Middleware
+//
+// Any message whose payload carries genomic offset coordinates is validated
+// against the current genome length BEFORE the switch dispatches to the
+// handler.  If a coordinate is out-of-range the middleware throws a RangeError
+// which is caught by the outer try/catch and returned to the UI as an ERROR
+// message — no silent reads into uninitialised slab memory can occur.
+//
+// Coordinate field conventions:
+//   offset, start, end              — generic genomic byte offsets
+//   startOffset, endOffset          — DiffEngine slab-relative offsets (also checked)
+//   templateStart, templateEnd      — PCR template window
+//
+// A genome length of 0 means no genome is loaded yet; in that case the check
+// is skipped so the engine can still process INIT / STREAM_CHUNK messages.
+// ─────────────────────────────────────────────────────────────────────────────
+function assertOffsetInBounds(value: number, genomeLength: number, label: string): void {
+  if (genomeLength === 0) return; // genome not yet loaded — defer all checks
+  if (!Number.isFinite(value)) {
+    throw new RangeError(`BOUNDS_VIOLATION: ${label}=${value} is not a finite number`);
+  }
+  if (value < 0 || value >= genomeLength) {
+    throw new RangeError(
+      `BOUNDS_VIOLATION: ${label}=${value} is outside genome range [0, ${genomeLength - 1}]`
+    );
+  }
+}
+
+/**
+ * boundsCheckMiddleware
+ *
+ * Extracts all offset-bearing fields from `payload` by message `type` and
+ * validates each against the current genome length.
+ *
+ * Strict-checked fields (must be within [0, genomeLength-1]):
+ *   offset, startOffset, templateStart
+ *
+ * Lax-checked fields (must be ≥ 0; handlers clamp the upper bound internally):
+ *   start, end, endOffset, templateEnd
+ *
+ * Called once per message at the top of self.onmessage before the switch.
+ */
+function boundsCheckMiddleware(
+  type: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  payload: any,
+  genomeLength: number
+): void {
+  if (!payload || genomeLength === 0) return;
+
+  // Messages that carry raw byte offsets into the genome
+  const OFFSET_BEARING_TYPES = new Set([
+    'LOAD_SLICE',
+    'PERFORM_SURGICAL_MUTATION',
+    'DIFF_REQUEST',
+    'GET_FEATURES_AT',
+    'FIND_MOTIF',
+    'PREDICT_SPLICE_SITES',
+    'PREDICT_ISOFORMS',
+    'FIND_RESTRICTION_SITES',
+    'SIMULATE_PCR_ADVANCED',
+    'RUN_ISOFORM_SCAN',
+    'VERIFY_SLAB_STATE', // no offsets, but safe to include
+  ]);
+
+  if (!OFFSET_BEARING_TYPES.has(type)) return;
+
+  // Strict checks — these must be inside the genome
+  if (typeof payload.offset === 'number')
+    assertOffsetInBounds(payload.offset, genomeLength, 'offset');
+  if (typeof payload.startOffset === 'number')
+    assertOffsetInBounds(payload.startOffset, genomeLength, 'startOffset');
+  if (typeof payload.templateStart === 'number')
+    assertOffsetInBounds(payload.templateStart, genomeLength, 'templateStart');
+
+  // Lax checks — must not be negative; upper-bound clamping is in the handler
+  for (const field of ['start', 'end', 'endOffset', 'templateEnd'] as const) {
+    const val = payload[field as keyof typeof payload];
+    if (typeof val === 'number' && Number.isFinite(val) && val < 0) {
+      throw new RangeError(
+        `BOUNDS_VIOLATION: ${field}=${val} is negative`
+      );
+    }
+  }
+}
+
 // ---------- Worker Message Handling (updated for async) ----------
 const engine = new ArkheEngine();
 
 self.onmessage = async (e: MessageEvent) => {
   const { type, id, payload } = e.data;
+
+  // ── SPRINT 1 FIX — TASK 4: Bounds-check middleware ───────────────────────
+  // Validate all offset coordinates against the current genome length before
+  // dispatching.  Throws RangeError (caught below) on any out-of-bounds access.
+  boundsCheckMiddleware(type, payload, engine.slabManager.getGenomeLength());
+  // ─────────────────────────────────────────────────────────────────────────
 
   try {
     switch (type) {
@@ -1908,7 +2035,7 @@ self.onmessage = async (e: MessageEvent) => {
         const requestId = engine.getNextRequestId();
         const result = await engine.loadSlice(payload, requestId);
         if (result) {
-          postMessage({ type: 'SLICE', id, payload: result }, [result.buffer]);
+          postMessage({ type: 'SLICE', id, payload: result }, { transfer: [result.buffer] });
         } else {
           postMessage({ type: 'SLICE_CANCELLED', id, payload: { reason: 'superseded' } });
         }
@@ -1921,6 +2048,8 @@ self.onmessage = async (e: MessageEvent) => {
           payload: { slabIndex: payload.slabIndex, offset: payload.offset, txId: payload.txId },
         });
         const result = await engine.performSurgicalMutation(payload, e.data.transferables || []);
+        // ── SPRINT 1 (FR-01): Record applied txId so VERIFY_SLAB_STATE can detect drift
+        engine.slabManager.setCurrentTxId(result.txId);
         postMessage({ type: 'MUTATION_RESULT', id, payload: result });
 
         const regionStart = Math.max(0, result.offset - 10);
@@ -1932,7 +2061,7 @@ self.onmessage = async (e: MessageEvent) => {
             id,
             payload: { start: regionStart, end: regionEnd, buffer: patchBuffer },
           },
-          [patchBuffer as ArrayBuffer]
+          { transfer: [patchBuffer as ArrayBuffer] }
         );
         break;
       }
@@ -2147,6 +2276,10 @@ self.onmessage = async (e: MessageEvent) => {
       }
       case 'RESTORE_HISTORY': {
         engine.chronos.restore(payload.commits, payload.branches, payload.headCommitId);
+        // ── SPRINT 1 (FR-01): Anchor the SlabManager's currentTxId to the restored head
+        if (payload.headCommitId) {
+          engine.slabManager.setCurrentTxId(payload.headCommitId);
+        }
         postMessage({ type: 'RESTORE_HISTORY_RESULT', id, payload: { ok: true } });
         break;
       }
@@ -2159,6 +2292,188 @@ self.onmessage = async (e: MessageEvent) => {
         postMessage({ type: 'FOLD_PROTEIN_RESULT', id, payload: fold });
         break;
       }
+      // ──────────────────────────────────────────────────────────────────────────
+      // SPRINT 1 FIX — TASK 1: Phantom Case Handlers
+      //
+      // These three message types were dispatched by the UI but had no
+      // corresponding handler in the worker switch — every invocation silently
+      // fell through to the `default:` warn and was discarded.
+      // ──────────────────────────────────────────────────────────────────────────
+
+      // ── VERIFY_SLAB_STATE ─────────────────────────────────────────────────
+      //
+      // Reconciliation entry point for the Frozen Recovery fix (FR-01, documented
+      // in SlabManager.ts).  The main thread sends this message after a cloud sync
+      // to confirm that the worker's physical slab bytes reflect the expected commit.
+      //
+      // Payload : { expectedTxId: string }
+      // Response: { status: 'ok' | 'hard_reset_required', slabVersion: number }
+      //
+      //   'ok'                  — txId matches; slabs are consistent.
+      //   'hard_reset_required' — txId mismatch detected; SlabManager.hardReset()
+      //                           was called; the main thread must trigger a full
+      //                           genome re-load (RESET_ENGINE → STREAM → RESTORE_HISTORY).
+      case 'VERIFY_SLAB_STATE': {
+        const { expectedTxId } = payload as { expectedTxId: string };
+        const status = engine.slabManager.revertToSnapshot(expectedTxId);
+        const slabVersion = engine.slabManager.getSlabVersion();
+        if (status === 'hard_reset_required') {
+          logToUI(
+            'WORKER',
+            `VERIFY_SLAB_STATE: txId mismatch — hard reset performed ` +
+            `(new slabVersion=${slabVersion})`,
+            'warning'
+          );
+        } else {
+          logToUI('WORKER', `VERIFY_SLAB_STATE: slabs consistent (txId="${expectedTxId}")`, 'info');
+        }
+        postMessage({
+          type: 'VERIFY_SLAB_STATE_RESULT',
+          id,
+          payload: { status, slabVersion },
+        });
+        break;
+      }
+
+      // ── RUN_FULL_AUDIT ────────────────────────────────────────────────────
+      //
+      // Triggers a comprehensive, synchronous audit of the currently loaded
+      // genome.  Forces fresh Sentinel, ORF and Synteny scans and returns a
+      // consolidated report in a single response message.
+      //
+      // Payload : {} (empty — no parameters required)
+      // Response: {
+      //   genomeLength  : number,
+      //   slabVersion   : number,
+      //   currentTxId   : string | null,
+      //   sentinel      : SentinelSummary | null,
+      //   orf           : ORFScanResult  | null,
+      //   syntenyAnchors: SyntenyAnchor[],
+      //   timestamp     : number,
+      // }
+      case 'RUN_FULL_AUDIT': {
+        const genomeLength = engine.slabManager.getGenomeLength();
+        logToUI('SYSTEM', `Full audit started — genome ${genomeLength} bp`, 'info');
+
+        // Force fresh Sentinel scan (synchronous for the summary)
+        const sentinelSummary = engine.refreshSentinelScan();
+
+        // Force fresh ORF scan (kicks off incremental background scan and
+        // returns whatever the first batch produces)
+        const orfResult = engine.refreshORFScan();
+
+        // Force fresh Synteny scan (starts incremental background scan)
+        engine.refreshSyntenyScan();
+        const syntenyAnchors = engine.getSyntenyAnchors();
+
+        const auditResult = {
+          genomeLength,
+          slabVersion: engine.slabManager.getSlabVersion(),
+          currentTxId: engine.slabManager.getCurrentTxId(),
+          sentinel: sentinelSummary,
+          orf: orfResult,
+          syntenyAnchors,
+          timestamp: Date.now(),
+        };
+
+        postMessage({ type: 'RUN_FULL_AUDIT_RESULT', id, payload: auditResult });
+        logToUI(
+          'SYSTEM',
+          `Full audit complete — sentinel:${sentinelSummary ? sentinelSummary.bins.length + ' bins' : 'pending'}, ` +
+          `orfs:${orfResult ? orfResult.totalORFs : 'pending'}, ` +
+          `anchors:${syntenyAnchors.length}`,
+          'success'
+        );
+        break;
+      }
+
+      // ── RUN_ISOFORM_SCAN ──────────────────────────────────────────────────
+      //
+      // Performs a combined splice-site prediction + isoform enumeration scan
+      // over a genomic region, interfacing with SlabManager to read the raw
+      // bytes and with BioLogic to compute all isoform products.
+      //
+      // Payload : { start: number; end: number; strand?: '+' | '-' }
+      // Response: {
+      //   start        : number,
+      //   end          : number,
+      //   strand       : '+' | '-',
+      //   spliceSites  : SpliceSite[],
+      //   isoformGroups: Array<{ orf: ORF; isoforms: SpliceIsoform[] }>,
+      //   totalIsoforms: number,
+      //   timestamp    : number,
+      // }
+      case 'RUN_ISOFORM_SCAN': {
+        const scanStart: number = payload.start ?? 0;
+        const scanEnd: number   = Math.min(
+          payload.end ?? engine.slabManager.getGenomeLength() - 1,
+          engine.slabManager.getGenomeLength() - 1
+        );
+        const scanStrand: '+' | '-' = payload.strand ?? '+';
+
+        if (scanStart > scanEnd) {
+          postMessage({
+            type: 'RUN_ISOFORM_SCAN_RESULT',
+            id,
+            payload: {
+              start: scanStart, end: scanEnd, strand: scanStrand,
+              spliceSites: [], isoformGroups: [], totalIsoforms: 0,
+              timestamp: Date.now(),
+            },
+          });
+          break;
+        }
+
+        // Read the region bytes from the SlabManager
+        const scanRegion = engine.slabManager.readRegion(scanStart, scanEnd);
+
+        // Predict splice sites within this buffer
+        const spliceSites = await engine.predictSpliceSites(scanRegion, scanStrand);
+
+        // Find all ORFs that overlap the requested range (from cache or fresh scan)
+        const overlappingORFs = engine.getORFsInRange(scanStart, scanEnd);
+
+        // Generate isoforms for each ORF that has qualifying splice sites
+        const isoformGroups: Array<{ orf: typeof overlappingORFs[0]; isoforms: Awaited<ReturnType<typeof engine.predictIsoforms>> }> = [];
+        let totalIsoforms = 0;
+
+        for (const orf of overlappingORFs) {
+          // Translate orf coordinates to region-local for isoform prediction
+          const localORF = {
+            ...orf,
+            start: Math.max(0, orf.start - scanStart),
+            end:   Math.min(scanRegion.length - 1, orf.end - scanStart),
+          };
+          const isoforms = await engine.predictIsoforms(scanRegion, localORF, spliceSites);
+          if (isoforms.length > 0) {
+            isoformGroups.push({ orf, isoforms });
+            totalIsoforms += isoforms.length;
+          }
+        }
+
+        logToUI(
+          'WORKER',
+          `Isoform scan [${scanStart}–${scanEnd}] (${scanStrand}): ` +
+          `${spliceSites.length} splice sites, ${totalIsoforms} isoforms across ${isoformGroups.length} ORFs`,
+          totalIsoforms > 0 ? 'success' : 'info'
+        );
+
+        postMessage({
+          type: 'RUN_ISOFORM_SCAN_RESULT',
+          id,
+          payload: {
+            start: scanStart,
+            end:   scanEnd,
+            strand: scanStrand,
+            spliceSites,
+            isoformGroups,
+            totalIsoforms,
+            timestamp: Date.now(),
+          },
+        });
+        break;
+      }
+
       default:
         console.warn('Unknown message type', type);
     }

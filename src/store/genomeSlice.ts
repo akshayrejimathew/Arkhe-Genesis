@@ -1,5 +1,4 @@
 /**
- * src/store/genomeSlice.ts
  *
  * ── PURPOSE ──────────────────────────────────────────────────────────────────
  * Zustand slice that owns everything related to the genome engine:
@@ -64,6 +63,7 @@
  *
  *   LB-04 — Zombie `chronosHead` in COMMIT_SYNC: 3-tier branch fallback.
  *   LB-09 — Direct state mutation in `loadFile`: fresh Map/Set via set().
+ *   SPRINT 2 FIX — Race-condition lock: `isProcessing` flag on loadFile / loadGenomeFromCloud.
  *   LB-10 — Meaningless type cast in CHRONOS_HISTORY: TransactionSummary[].
  *   LB-11 / LB-14 — Ghost Data & Detached ArrayBuffers: viewportVersion.
  *   TS COMPILER FIX — StoreMutators inlined as middleware tuple.
@@ -77,6 +77,39 @@
  *   SPRINT 5 FIX 4 — TypeScript implicit any in COMMIT_SYNC.
  *   SPRINT 5 FIX 5 — Adaptive slab sizing.
  *   CF-04 — Chronos Viewport Sync (undo/redo requestViewport call).
+ *
+ * ── PINNACLE RUO STATE INTEGRITY PATCH ───────────────────────────────────────
+ *
+ *   MEM-01 (CRITICAL) — try/finally guard on loadGenomeFromCloud
+ *     The original code set isProcessing: true on entry and released it only
+ *     on success.  Any failure path (Supabase RLS error, network timeout,
+ *     worker stream failure) left isProcessing permanently true, silently
+ *     bricking all subsequent load operations until a full-page reload.
+ *     The `set({ isProcessing: false })` call is now unconditionally in a
+ *     finally block on every async path that acquires the lock.
+ *
+ *   MEM-01b — try/finally guard on loadFile
+ *     Same permanent-lock pattern existed in loadFile.  The existing finally
+ *     block is preserved and supplemented with activeGenomeId reset on failure.
+ *
+ *   SI-01 — 45-second safety watchdog on all lock-acquiring operations
+ *     A clearable setTimeout is armed whenever isProcessing is acquired.  If
+ *     the worker does not respond within 45 seconds (network stall, worker
+ *     crash bypass), the watchdog fires: releases isProcessing, resets
+ *     activeGenomeId to null, and writes a SYSTEM ERROR to the SystemLog.
+ *     The watchdog is cleared immediately on normal completion (in finally).
+ *
+ *   SI-02 — activeGenomeId reset to null on load failure
+ *     Previously a failed loadGenomeFromCloud left activeGenomeId set to the
+ *     attempted genome ID, causing the viewport and SequenceView to attempt
+ *     rendering against an empty / partially-loaded worker state.  On failure
+ *     activeGenomeId is now reset to null via the failure-path finally block.
+ *
+ *   MEM-02 (HIGH) — Atomic race guard in loadGenomeFromCloud
+ *     The original isProcessing + isRealigning guard read state via two
+ *     separate get() calls.  A Zustand set() between microtask boundaries
+ *     could produce a torn read.  Fixed by capturing both flags from a single
+ *     const { isProcessing, isRealigning } = get() snapshot.
  */
 
 import type { StateCreator } from 'zustand';
@@ -206,6 +239,7 @@ const initialGenomeState = {
   //                        Diverges from slabVersion in the window between a
   //                        hard reset and the first successful viewport refresh.
   //
+  isProcessing: false,
   isRealigning: false,
   slabVersion: 0,
   slabAcknowledgedVersion: 0,
@@ -744,6 +778,39 @@ export const createGenomeSlice: StateCreator<
     if (!worker) throw new Error('Worker not initialised');
     if (!user)   throw new Error('User not authenticated');
 
+    // ── SPRINT 2 FIX (TASK 1) — Race-Condition Lock ───────────────────────
+    // If a prior load is still in-flight, reject the incoming request with a
+    // visible SystemLog warning instead of corrupting the worker state.
+    if (get().isProcessing) {
+      get().addSystemLog({
+        timestamp: Date.now(),
+        category : 'SYSTEM',
+        message  : '⚠️ System Busy: Please wait for current sequence processing to finish.',
+        level    : 'warning',
+      });
+      return;
+    }
+
+    set({ isProcessing: true });
+
+    // ── SI-01: 45-second safety watchdog ─────────────────────────────────
+    // If the worker stops responding (network stall, unhandled crash) after
+    // acquiring the processing lock, the watchdog fires unconditionally,
+    // releases the lock, and surfaces an error log.  Cleared in finally.
+    let _loadFileWatchdog: ReturnType<typeof setTimeout> | null =
+      setTimeout(() => {
+        _loadFileWatchdog = null;
+        set({ isProcessing: false, activeGenomeId: null });
+        get().addSystemLog({
+          timestamp: Date.now(),
+          category : 'SYSTEM',
+          message  : '⏱️ loadFile watchdog: worker did not respond within 45 s. ' +
+                     'Processing lock force-released.  Please reload the file.',
+          level    : 'error',
+        });
+      }, 45_000);
+
+    try {
     // Reset engine with adaptive slab size hint (SPRINT 5 FIX 5).
     await postAndWait(worker, 'RESET_ENGINE', { expectedFileSize: file.size });
 
@@ -820,6 +887,17 @@ export const createGenomeSlice: StateCreator<
       message  : `🧬 Genome loaded: ${genomeLength.toLocaleString()} bp`,
       level    : 'success',
     });
+    } catch (err) {
+      // SI-02: Reset activeGenomeId to null on failure so the viewport does
+      // not attempt to render against an empty / partially-loaded worker state.
+      set({ activeGenomeId: null });
+      throw err;
+    } finally {
+      // MEM-01b: Unconditionally release the processing lock and disarm the
+      // safety watchdog (SI-01) regardless of success, failure, or timeout.
+      if (_loadFileWatchdog !== null) clearTimeout(_loadFileWatchdog);
+      set({ isProcessing: false });
+    }
   },
 
   /**
@@ -845,7 +923,54 @@ export const createGenomeSlice: StateCreator<
     if (!worker) throw new Error('Worker not initialised');
     if (!user)   throw new Error('User not authenticated');
 
-    set({ isSyncing: true, activeGenomeId: genomeId });
+    // ── SPRINT 2 FIX (TASK 1) — Race-Condition Lock ───────────────────────
+    // FR-01 recovery calls loadGenomeFromCloud intentionally while
+    // isRealigning is true; that path is explicitly permitted. All other
+    // callers that arrive while a load is in-flight are rejected.
+    //
+    // MEM-02 FIX: Read both flags from a single get() snapshot.  Two separate
+    // get() calls create a torn-read window: a Zustand set() from a push-
+    // notification handler (worker.addEventListener) can fire between
+    // microtask boundaries, causing isProcessing and isRealigning to be read
+    // from different snapshots and allowing a double-load race.
+    const { isProcessing: _lockCheck, isRealigning: _realignCheck } = get();
+    if (_lockCheck && !_realignCheck) {
+      get().addSystemLog({
+        timestamp: Date.now(),
+        category : 'SYSTEM',
+        message  : '⚠️ System Busy: Please wait for current sequence processing to finish.',
+        level    : 'warning',
+      });
+      return;
+    }
+
+    set({ isProcessing: true, isSyncing: true, activeGenomeId: genomeId });
+
+    // ── SI-01: 45-second safety watchdog ─────────────────────────────────
+    // Arms immediately after acquiring the lock.  Cleared in the outer
+    // finally block.  If the worker never responds (Supabase timeout,
+    // network drop, unhandled worker crash), the watchdog releases the lock
+    // and clears activeGenomeId so the UI does not freeze indefinitely.
+    let _cloudLoadWatchdog: ReturnType<typeof setTimeout> | null =
+      setTimeout(() => {
+        _cloudLoadWatchdog = null;
+        set({ isProcessing: false, isSyncing: false, activeGenomeId: null });
+        get().addSystemLog({
+          timestamp: Date.now(),
+          category : 'SYSTEM',
+          message  : '⏱️ loadGenomeFromCloud watchdog: worker did not respond within 45 s. ' +
+                     'Processing lock force-released.  Please retry.',
+          level    : 'error',
+        });
+      }, 45_000);
+
+    // ── MEM-01 FIX: Outer try/finally wraps ALL post-lock work ─────────────
+    // Previously there was no try/finally around the Supabase restore call.
+    // A failed restoreSession (RLS violation, network error, invalid genomeId)
+    // would throw, leaving isProcessing permanently true.  The entire post-lock
+    // body is now wrapped so the finally block unconditionally releases both
+    // isProcessing and the safety watchdog regardless of which step fails.
+    try {
 
     // ── Fetch session from Supabase ───────────────────────────────────────
     const restoreResult = await PersistenceManager.restoreSession(genomeId);
@@ -964,6 +1089,27 @@ export const createGenomeSlice: StateCreator<
       message  : `🔄 Session restored: ${genome.name}, ${convertedCommits.length} commits`,
       level    : 'success',
     });
+
+    } catch (err) {
+      // SI-02: On any failure, reset activeGenomeId to null so SequenceView
+      // and the viewport do not attempt to render against an empty or
+      // partially-loaded worker.  The worker was already reset in the inner
+      // stream try/catch (SPRINT 5 FIX 2); this catch covers failures outside
+      // the stream loop (Supabase restore, RESTORE_HISTORY, metadata fetch).
+      set({ activeGenomeId: null, isSyncing: false });
+      get().addSystemLog({
+        timestamp: Date.now(),
+        category : 'SYSTEM',
+        message  : `❌ Cloud load failed: ${err instanceof Error ? err.message : String(err)}`,
+        level    : 'error',
+      });
+      throw err;
+    } finally {
+      // MEM-01 FIX: Unconditionally release the processing lock and disarm
+      // the safety watchdog on every exit path (success, failure, or timeout).
+      if (_cloudLoadWatchdog !== null) clearTimeout(_cloudLoadWatchdog);
+      set({ isProcessing: false });
+    }
   },
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1378,4 +1524,7 @@ export const createGenomeSlice: StateCreator<
 
   // FR-01: Setter for the realignment flag (exposed for testing / manual override)
   setIsRealigning: (realigning: boolean) => set({ isRealigning: realigning }),
+
+  // SPRINT 2 FIX: Setter for the processing lock (exposed for testing)
+  setIsProcessing: (processing: boolean) => set({ isProcessing: processing }),
 });

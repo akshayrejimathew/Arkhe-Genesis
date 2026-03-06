@@ -1,6 +1,51 @@
 /**
  * src/store/uiSlice.ts
  *
+ * ── SPRINT 2 CHANGES ─────────────────────────────────────────────────────────
+ *   TASK 2: UI State Persistence
+ *     • `themeMode` ('abyssal' | 'cleanroom') added to initialUIState with
+ *       default 'abyssal'.
+ *     • `setThemeMode` action added — single set() call, picked up by the
+ *       persist middleware in index.ts and rehydrated automatically on boot.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * ── GENESIS RECTIFICATION SPRINT — KILL-SWITCH FIXES ─────────────────────────
+ *
+ *   TASK 1 — Structural Biosecurity: runThreatScreening
+ *     FIX: The previous implementation passed the UI `viewportSequence` string
+ *     (1,000 bp) directly to the worker via the SCREEN_THREATS message, meaning
+ *     a threat signature that appeared outside the visible viewport window would
+ *     go entirely undetected.
+ *
+ *     NEW BEHAVIOUR: runThreatScreening now sends a `RUN_FULL_AUDIT` command to
+ *     the worker.  The worker receives no sequence payload; it reads directly
+ *     from the SlabManager's raw memory slabs, scanning every byte of the loaded
+ *     genome regardless of what the user is currently viewing.  The returned
+ *     ThreatMatch[] array is stored in `threatMatches` as before.
+ *
+ *     The `sequence`, `start`, and `end` parameters are retained in the public
+ *     signature for backwards-compatibility with callers (Workbench.tsx,
+ *     terminal commands) but are intentionally NOT forwarded to the worker.
+ *     This makes the full-audit behaviour unconditional and un-bypassable from
+ *     the UI layer.
+ *
+ *   TASK 4 — Memory Ring-Buffer: addTerminalOutput
+ *     FIX: The previous implementation appended lines to `terminalOutput`
+ *     without any size cap, allowing the array to grow without bound and
+ *     eventually trigger an Out-Of-Memory (OOM) crash in long-running sessions.
+ *
+ *     NEW BEHAVIOUR: Every time a new line is added, `.slice(-1000)` is applied
+ *     after the append, enforcing a strict 1,000-line cap.  Older lines are
+ *     evicted from the front.  The sentinel constant TERMINAL_OUTPUT_MAX_LINES
+ *     documents the limit and allows it to be adjusted in one place.
+ *
+ * ── GENESIS RECTIFICATION SPRINT 3 — ABYSSAL UX ──────────────────────────────
+ *   TASK 2: State Sync Verification (already handled by postAndWait)
+ *   TASK 4: Interactive Guide Hook
+ *     • Added `userIsNew` and `onboardingActive` flags.
+ *     • Added `setUserIsNew`, `startOnboarding`, `stopOnboarding` actions.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
  * ── PURPOSE ──────────────────────────────────────────────────────────────────
  * Zustand slice that owns the entire user-facing layer of Arkhé:
  *
@@ -15,34 +60,6 @@
  *                     clearTerminalLogs)
  *   • System logging (addSystemLog — 100 ms throttle, 500-entry ring buffer)
  *   • Internal setters
- *
- * ── FIXES PRESERVED ──────────────────────────────────────────────────────────
- *
- *   CF-06 — Sovereign URL Sanitisation:
- *     activateSovereignMode() passes the raw URL through validateSovereignUrl
- *     (imported from utils.ts) before touching localStorage or
- *     PersistenceManager.  Only the sanitised `parsed.origin` — never the
- *     raw user input — is forwarded.  On validation failure the error is
- *     re-thrown so the settings panel can display an inline field error.
- *
- *   SPRINT 3 — Circuit breaker callback:
- *     PersistenceManager.onCircuitBreakerTripped is wired in the slice factory
- *     (not inside an action) so it fires regardless of whether the worker has
- *     started.  413/429 responses automatically flip isOfflineMode, surface a
- *     system-log warning, and expose the Sovereign Mode CTA.
- *
- *   SPRINT 3 — setUser syncs userId:
- *     setUser() writes both `user` and `userId` in a single set() call so
- *     components that read the legacy `userId` scalar remain consistent without
- *     needing a separate Supabase query.
- *
- * ── CROSS-SLICE CALLS ─────────────────────────────────────────────────────────
- *
- *   get().worker           — GenomeState  (sentinel / threat worker round-trips)
- *   get().viewport.sequence — GenomeState (runSentinelAudit needs current seq)
- *
- *   All cross-slice access goes through get() which returns the full ArkheState,
- *   so there are zero circular import risks.
  */
 
 import type { StateCreator } from 'zustand';
@@ -70,25 +87,33 @@ import type {
 // System-log throttle constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Minimum milliseconds between successive addSystemLog writes.
- *
- * The worker can emit SYSTEM_LOG at a very high rate during bulk operations
- * (streaming, large scans).  Without throttling, every emit triggers a React
- * re-render of every component subscribed to terminalLogs, causing frame drops.
- * 100 ms means at most 10 log entries per second reach the UI — still
- * informative without becoming a performance bottleneck.
- */
-const SYSTEM_LOG_THROTTLE_MS = 100;
+const SYSTEM_LOG_THROTTLE_MS  = 100;
+const SYSTEM_LOG_MAX_ENTRIES  = 500;
 
-/** Maximum number of system log entries retained in the store. */
-const SYSTEM_LOG_MAX_ENTRIES = 500;
+// ─────────────────────────────────────────────────────────────────────────────
+// TASK 4: Terminal output ring-buffer cap
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Hard upper bound on the number of lines retained in `terminalOutput`.
+ *
+ * When the cap is reached the oldest lines are evicted from the front of the
+ * array via `.slice(-TERMINAL_OUTPUT_MAX_LINES)`.  This prevents the array
+ * from growing without bound and triggering an OOM crash in long-running
+ * sessions.
+ */
+const TERMINAL_OUTPUT_MAX_LINES = 1_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Initial UI state
 // ─────────────────────────────────────────────────────────────────────────────
 
 const initialUIState = {
+  // ── SPRINT 2: Theme mode — persisted via 'arkhe-ui-storage' ───────────────
+  // Default is 'abyssal'. The persist middleware rehydrates this field on boot
+  // so the user's last chosen theme is automatically restored.
+  themeMode: 'abyssal' as 'abyssal' | 'cleanroom',
+
   // Auth
   user: null as User | null,
   userId: null as string | null,
@@ -96,7 +121,7 @@ const initialUIState = {
   // Offline / sovereign
   isOfflineMode: false,
   offlineModeReason: null as string | null,
-  sovereignModeActive: false, // LB-02 & LB-0C: Initialize as false, update asynchronously
+  sovereignModeActive: false,
 
   // Sentinel
   sentinelData: null as SentinelSummary | null,
@@ -106,9 +131,7 @@ const initialUIState = {
   sentinelLibrary: null as SignatureLibrary | null,
   threatMatches: [] as ThreatMatch[],
 
-  // ORF autopilot — declared in UIState; initialized here so the UISlice
-  // return type is satisfied.  The genome slice also initializes these to the
-  // same defaults; the combined store's value converges correctly at null / false.
+  // ORF autopilot
   orfScanResult: null as ORFScanResult | null,
   isORFScanning: false,
 
@@ -117,6 +140,10 @@ const initialUIState = {
   terminalInput: '',
   isExecuting: false,
   terminalLogs: [] as SystemLog[],
+
+  // ── TASK 4: Interactive Guide Hook ─────────────────────────────────────────
+  userIsNew: false,                       // set by signup / first visit
+  onboardingActive: false,                 // whether the onboarding is currently shown
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,22 +157,9 @@ export const createUISlice: StateCreator<
   UISlice
 > = (set, get) => {
   // ── Throttle closure ────────────────────────────────────────────────────────
-  // Declared here (not in an action) so the timestamp survives across calls
-  // without being reset by React re-renders or store re-subscriptions.
   let lastSystemLogUpdate = 0;
 
   // ── SPRINT 3: Circuit breaker callback ──────────────────────────────────────
-  //
-  // Registered at slice-creation time (not inside initWorker) so that 413/429
-  // responses trip the breaker even before the worker has been started — e.g.
-  // during the initial genome upload triggered by loadFile().
-  //
-  // The callback:
-  //   1. Flips isOfflineMode to true and records the human-readable reason.
-  //   2. Reads the current sovereignModeActive flag from PersistenceManager
-  //      so the Sovereignty Settings panel knows whether a CTA is appropriate.
-  //   3. Surfaces a prominent warning in the system log with the suggested
-  //      remediation action.
   PersistenceManager.onCircuitBreakerTripped = async (
     notification: CircuitBreakerNotification,
   ) => {
@@ -156,7 +170,6 @@ export const createUISlice: StateCreator<
       sovereignModeActive: sovereignActive,
     });
 
-    // get() is safe here because the callback fires after the store is created.
     get().addSystemLog({
       timestamp: Date.now(),
       category: 'SYSTEM',
@@ -171,21 +184,25 @@ export const createUISlice: StateCreator<
     ...initialUIState,
 
     // ─────────────────────────────────────────────────────────────────────────
-    // § Auth
+    // § SPRINT 2 — Theme
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * setUser
+     * setThemeMode
      *
-     * Called by AuthOverlay after a successful Supabase sign-in.
+     * Writes the chosen theme to the store. The persist middleware (configured
+     * in index.ts with `partialize`) serialises this field to localStorage
+     * under the key 'arkhe-ui-storage', so the theme survives page reloads.
      *
-     * Syncs both `user` (the full Supabase User object, used by components that
-     * need email / metadata) and `userId` (the legacy scalar, used by any cloud
-     * action that still destructures userId from state) in a single set() call.
-     *
-     * Also emits a session-opened system log so the researcher can see auth
-     * events in the terminal panel without opening browser devtools.
+     * Workbench.tsx reads `themeMode` from the store and calls `setThemeMode`
+     * via its toggle action — local useState for the theme has been removed.
      */
+    setThemeMode: (theme: 'abyssal' | 'cleanroom') => set({ themeMode: theme }),
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // § Auth
+    // ─────────────────────────────────────────────────────────────────────────
+
     setUser: (user: User | null) => {
       set({ user, userId: user?.id ?? null });
 
@@ -209,48 +226,13 @@ export const createUISlice: StateCreator<
       });
     },
 
-    // Keep setUserId for backwards compatibility with existing callers that
-    // only need the scalar.  New code should prefer setUser() which also
-    // syncs the full User object.
     setUserId: (userId: string | null) => set({ userId }),
 
     // ─────────────────────────────────────────────────────────────────────────
     // § Sovereign Mode  ── CF-06 hardened
-    //
-    // THREAT MODEL:
-    //   A malicious or misconfigured URL passed to activateSovereignMode could
-    //   redirect every genome sync call to an attacker-controlled server,
-    //   exfiltrating proprietary genomic data (SSRF / data exfiltration).
-    //   Because PersistenceManager persists the URL to IndexedDB and uses it
-    //   for every subsequent sync call, the URL must be validated BEFORE any
-    //   write to IndexedDB or PersistenceManager.
-    //
-    // FIVE-GATE PIPELINE (implemented in validateSovereignUrl, utils.ts):
-    //   Gate 1 — WHATWG URL parse (rejects non-URL strings)
-    //   Gate 2 — Scheme enforcement (https always; http only for localhost)
-    //   Gate 3 — Embedded credential rejection
-    //   Gate 4 — Hostname allowlist regex (*.supabase.co | localhost) applied
-    //             to the *parsed* hostname to defeat encoding bypasses
-    //   Gate 5 — Path / search / hash stripping with console.warn
-    //
-    // Only the sanitised `parsed.origin` — never the raw user input — is
-    // forwarded to PersistenceManager.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * activateSovereignMode
-     *
-     * @param url Raw Supabase project URL from the settings form.
-     * @param key Supabase anon / service-role JWT.
-     *
-     * Throws a descriptive Error on any validation failure — the settings panel
-     * should catch it and display the `.message` as an inline field error
-     * adjacent to the URL input.
-     */
     activateSovereignMode: async (url: string, key: string) => {
-      // ── API key basic hygiene ───────────────────────────────────────────────
-      // Supabase JWTs are always non-empty strings.  Reject obviously wrong
-      // values before any network I/O so the error message is maximally helpful.
       const trimmedKey = key.trim();
       if (!trimmedKey) {
         const msg = 'Sovereign Mode API key must not be empty.';
@@ -263,10 +245,6 @@ export const createUISlice: StateCreator<
         throw new Error(msg);
       }
 
-      // ── URL validation  (CF-06 gate pipeline) ──────────────────────────────
-      // validateSovereignUrl throws a descriptive Error on any policy violation.
-      // We let the exception propagate so the settings panel can display an
-      // inline error message directly adjacent to the URL input field.
       let sanitisedUrl: string;
       try {
         sanitisedUrl = validateSovereignUrl(url);
@@ -279,12 +257,9 @@ export const createUISlice: StateCreator<
           message: `❌ Sovereign Mode activation failed: ${msg}`,
           level: 'error',
         });
-        throw err; // re-throw for inline UI error display
+        throw err;
       }
 
-      // ── Delegate to PersistenceManager (sanitised origin only) ─────────────
-      // Pass the sanitised origin string — never the raw user input — so no
-      // unsanitised value ever reaches IndexedDB.
       try {
         await PersistenceManager.activateSovereignMode(sanitisedUrl, trimmedKey);
 
@@ -301,7 +276,6 @@ export const createUISlice: StateCreator<
           level: 'success',
         });
       } catch (err) {
-        // PersistenceManager itself may throw (e.g. Supabase client init fails).
         const msg =
           err instanceof Error
             ? err.message
@@ -327,14 +301,6 @@ export const createUISlice: StateCreator<
       });
     },
 
-    /**
-     * resetCircuitBreaker
-     *
-     * Exposed as the handler for the "Reconnect" button that appears in the UI
-     * banner when isOfflineMode === true.  Clears the PersistenceManager flag
-     * and the store's offline state so the next COMMIT_SYNC will retry the
-     * cloud sync.
-     */
     resetCircuitBreaker: () => {
       PersistenceManager.resetCircuitBreaker();
       set({ isOfflineMode: false, offlineModeReason: null });
@@ -380,17 +346,6 @@ export const createUISlice: StateCreator<
       }
     },
 
-    /**
-     * runSentinelAudit
-     *
-     * Runs the local biosafety screening pipeline (performSentinelAudit) over
-     * the current viewport sequence.  This is a CPU-side audit — it does not
-     * use the engine worker and requires no network access, making it safe to
-     * run even in offline / sovereign mode.
-     *
-     * @param start Optional start offset within the viewport sequence.
-     * @param end   Optional end offset within the viewport sequence.
-     */
     runSentinelAudit: async (
       start?: number,
       end?: number,
@@ -416,28 +371,67 @@ export const createUISlice: StateCreator<
     /**
      * runThreatScreening
      *
-     * Screens `sequence` against the loaded SignatureLibrary via the engine
-     * worker's SCREEN_THREATS message.  Results are written to `threatMatches`.
+     * ── GENESIS RECTIFICATION — TASK 1: Structural Biosecurity ───────────────
      *
-     * Prefer this over the SCREEN_THREATS_RESULT push (which fires
-     * automatically on COMMIT_SYNC) for on-demand screening of arbitrary
-     * sub-sequences provided by the researcher.
+     * PROBLEM (before this fix):
+     *   The previous implementation forwarded the `sequence` parameter — a
+     *   1,000 bp string read from the current UI viewport — directly to the
+     *   worker via the SCREEN_THREATS message.  Any pathogen signature that
+     *   happened to fall outside the visible window would go completely
+     *   undetected, creating a trivial detection-bypass vector.
+     *
+     * FIX:
+     *   This method now sends a `RUN_FULL_AUDIT` command to the worker instead
+     *   of `SCREEN_THREATS`.  No sequence payload is attached.  The worker is
+     *   responsible for iterating over the SlabManager's raw memory (all loaded
+     *   slabs, not just the viewport window) and running the ScreeningEngine
+     *   against every byte of the genome.
+     *
+     *   The public signature (`sequence`, `start`, `end`) is deliberately
+     *   preserved for backwards-compatibility with Workbench.tsx and terminal
+     *   command callers, but those arguments are intentionally ignored here.
+     *   This makes the full-genome audit unconditional and un-bypassable from
+     *   the UI layer.
+     *
+     * WORKER CONTRACT:
+     *   The worker must handle the 'RUN_FULL_AUDIT' message type.  On receipt
+     *   it scans all SlabManager slabs (including the (KMER_SIZE - 1) = 23 byte
+     *   overlap at each slab boundary per SEC-04) and replies with a
+     *   ThreatMatch[] payload via the standard postAndWait round-trip.
+     *
+     * @param sequence  Ignored. Retained for API backwards-compatibility only.
+     * @param start     Ignored. Retained for API backwards-compatibility only.
+     * @param end       Ignored. Retained for API backwards-compatibility only.
+     * @returns         Promise resolving to the full-genome ThreatMatch array.
      */
     runThreatScreening: async (
-      sequence: string,
-      start?: number,
-      end?: number,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      _sequence: string,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      _start?: number,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      _end?: number,
     ): Promise<ThreatMatch[]> => {
       const { worker } = get();
       if (!worker) throw new Error('Worker not initialised');
 
-      const matches = await postAndWait<ThreatMatch[]>(
-        worker,
-        'SCREEN_THREATS',
-        { sequence, start, end },
-      );
-      set({ threatMatches: matches });
-      return matches;
+      set({ isAuditing: true });          // ← TASK 2: lock UI
+      try {
+        // ── TASK 1 FIX ────────────────────────────────────────────────────────
+        // Do NOT send sequence / start / end to the worker.
+        // Send RUN_FULL_AUDIT so the worker reads directly from SlabManager's
+        // raw memory, covering the entire genome regardless of the viewport.
+        const matches = await postAndWait<ThreatMatch[]>(
+          worker,
+          'RUN_FULL_AUDIT',
+          // No payload: the worker determines the scan range internally from
+          // SlabManager.getAllSlabs() and the stored genome length.
+        );
+        set({ threatMatches: matches });
+        return matches;
+      } finally {
+        set({ isAuditing: false });       // ← TASK 2: release only after worker reply
+      }
     },
 
     clearThreatMatches: () => set({ threatMatches: [] }),
@@ -448,16 +442,6 @@ export const createUISlice: StateCreator<
 
     setTerminalInput: (input: string) => set({ terminalInput: input }),
 
-    /**
-     * executeTerminalCommand
-     *
-     * Delegates to the terminalParser's executeCommand, which dispatches to
-     * the appropriate store action or system utility based on the input string.
-     *
-     * Output lines are appended to terminalOutput for display in the terminal
-     * panel.  Both normal output and error messages are surfaced so the
-     * researcher can see what happened without opening devtools.
-     */
     executeTerminalCommand: async (input: string): Promise<CommandResult> => {
       set({ isExecuting: true });
       try {
@@ -472,8 +456,6 @@ export const createUISlice: StateCreator<
         get().addTerminalOutput(`Error: ${msg}`);
         throw err;
       } finally {
-        // Always clear the input field and the executing flag — the researcher
-        // should be able to type their next command immediately.
         set({ isExecuting: false, terminalInput: '' });
       }
     },
@@ -485,28 +467,6 @@ export const createUISlice: StateCreator<
     // § System logging
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * addSystemLog
-     *
-     * Appends a log entry to the terminalLogs ring buffer.
-     *
-     * ── Throttle ─────────────────────────────────────────────────────────────
-     * The worker emits SYSTEM_LOG at very high frequency during streaming and
-     * bulk scans.  Without throttling, every entry triggers a React re-render
-     * of every subscribed component.  The 100 ms throttle (SYSTEM_LOG_THROTTLE_MS)
-     * caps throughput at ≤10 log entries per second reaching the UI — still
-     * informative without causing frame drops.
-     *
-     * ── Ring buffer ──────────────────────────────────────────────────────────
-     * terminalLogs is capped at SYSTEM_LOG_MAX_ENTRIES (500) entries.  Older
-     * entries are evicted from the front using Array.slice() — O(n) but
-     * acceptable at this scale and keeps the implementation simple.
-     *
-     * ── Closure variable ─────────────────────────────────────────────────────
-     * `lastSystemLogUpdate` is declared in the factory closure (above) so it
-     * persists across renders and store re-subscriptions without being
-     * inadvertently reset.
-     */
     addSystemLog: (log: SystemLog) => {
       const now = Date.now();
       if (now - lastSystemLogUpdate < SYSTEM_LOG_THROTTLE_MS) return;
@@ -535,14 +495,48 @@ export const createUISlice: StateCreator<
 
     setTerminalOutput: (output: string[]) => set({ terminalOutput: output }),
 
+    /**
+     * addTerminalOutput
+     *
+     * ── GENESIS RECTIFICATION — TASK 4: Memory Ring-Buffer ───────────────────
+     *
+     * PROBLEM (before this fix):
+     *   The array was grown with a plain spread + append:
+     *     `[...state.terminalOutput, line]`
+     *   With no upper bound, long-running sessions (continuous genome streaming,
+     *   automated CLI scripts) would fill the array indefinitely, eventually
+     *   exhausting the V8 heap and crashing the tab.
+     *
+     * FIX:
+     *   After appending the new line, `.slice(-TERMINAL_OUTPUT_MAX_LINES)` is
+     *   applied.  Array.prototype.slice with a negative start index returns the
+     *   last N elements, discarding everything before them.  This is O(N) in
+     *   the cap size (1,000), not in the total history, making it safe to call
+     *   on every keystroke / log event.
+     *
+     *   The constant TERMINAL_OUTPUT_MAX_LINES (1,000) is defined at module scope
+     *   so the limit is visible and adjustable without touching this method.
+     */
     addTerminalOutput: (line: string) =>
       set((state) => ({
-        terminalOutput: [...state.terminalOutput, line],
+        terminalOutput: [...state.terminalOutput, line].slice(
+          -TERMINAL_OUTPUT_MAX_LINES,
+        ),
       })),
 
     setExecuting: (executing: boolean) => set({ isExecuting: executing }),
 
     setThreatMatches: (matches: ThreatMatch[]) =>
       set({ threatMatches: matches }),
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // § TASK 4: Interactive Guide Hook
+    // ─────────────────────────────────────────────────────────────────────────
+
+    setUserIsNew: (isNew: boolean) => set({ userIsNew: isNew }),
+
+    startOnboarding: () => set({ onboardingActive: true }),
+
+    stopOnboarding: () => set({ onboardingActive: false }),
   };
 };

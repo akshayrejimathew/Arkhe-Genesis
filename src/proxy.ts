@@ -23,7 +23,7 @@ const PROTECTED_ROUTES = ['/workbench', '/settings'];
 // landing back on /login after a successful sign-in).
 const AUTH_ROUTES = ['/login'];
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   // ── Quick short-circuit: skip middleware for static assets and API routes ──

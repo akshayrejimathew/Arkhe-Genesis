@@ -13,6 +13,46 @@
  *   • Protein folding     (foldProtein with GDPR gate, clearProteinFold)
  *   • Internal setters    (setChronosHead … setFoldError)
  *
+ * ── GENESIS RECTIFICATION SPRINT — KILL-SWITCH FIX ──────────────────────────
+ *
+ *   TASK 3 — Cross-Domain Mutex: isProcessing guard in executeAtomicAction
+ *
+ *     PROBLEM (before this fix):
+ *       `applyLocalMutation` (and by extension undo / redo) was wrapped in
+ *       `executeAtomicAction` which serialised concurrent calls against each
+ *       other via the action queue.  However, it did NOT check the `isProcessing`
+ *       flag owned by `genomeSlice`.  `isProcessing` is set to `true` for the
+ *       entire duration of `loadFile` and `loadGenomeFromCloud` — operations that
+ *       stream raw genome bytes into the SlabManager in multi-chunk bursts.
+ *
+ *       Allowing a surgical mutation to land while a streaming load is in flight
+ *       corrupts the slab state: the PERFORM_SURGICAL_MUTATION message races
+ *       against STREAM_CHUNK messages; the SlabManager may apply the base-pair
+ *       edit to partially-written slab memory and then have those bytes
+ *       overwritten by the next STREAM_CHUNK, silently discarding the edit.
+ *       Worse, the Chronos history will record a txId for a mutation that was
+ *       never actually persisted, causing a split-brain between the UI-visible
+ *       sequence and the stored commit graph.
+ *
+ *     FIX:
+ *       At the start of each atomic action (before `set({ isLocked: true })`),
+ *       `executeAtomicAction` reads `get().isProcessing` from the combined store.
+ *       If it is `true`, the action is rejected immediately by throwing an
+ *       `EngineLockError` with the message:
+ *
+ *         "Engine Locked: Cannot mutate while streaming genome."
+ *
+ *       The rejection is also written to the System Log at level 'warning' so
+ *       the researcher sees clear feedback in the terminal panel.
+ *
+ *       The `EngineLockError` class is exported so callers can `instanceof`-check
+ *       it and show a non-alarming "try again after load" notice rather than a
+ *       generic error banner.
+ *
+ *       QUEUE CONTINUITY: The rejection path does NOT break the action queue.
+ *       The silenced tail is stored as before, so subsequent actions can still
+ *       execute once `isProcessing` returns to `false`.
+ *
  * ── NEW FIX (MX-01) ──────────────────────────────────────────────────────────
  *
  *   MX-01 — Sequential Execution Queue (Mutex) for undo / redo / applyLocalMutation:
@@ -31,13 +71,14 @@
  *       resolved promise and each enqueued action appends to the tail, so
  *       execution is strictly FIFO.  The full sequence for each item:
  *
- *         1. Set isLocked = true
- *         2. Post the primary worker message (UNDO / REDO / PERFORM_SURGICAL_MUTATION)
- *         3. Dispatch GET_HEAD and write result to chronosHead (LB-06)
- *         4. Call requestViewport to sync the rendered window (CF-04)
- *         5. Set isLocked = false
+ *         1. Check isProcessing (TASK 3 cross-domain mutex guard)
+ *         2. Set isLocked = true
+ *         3. Post the primary worker message (UNDO / REDO / PERFORM_SURGICAL_MUTATION)
+ *         4. Dispatch GET_HEAD and write result to chronosHead (LB-06)
+ *         5. Call requestViewport to sync the rendered window (CF-04)
+ *         6. Set isLocked = false
  *
- *       The next queued item only begins step 1 once step 5 of the previous
+ *       The next queued item only begins step 1 once step 6 of the previous
  *       item has completed, eliminating all inter-action race conditions.
  *
  *     QUEUE CONTINUITY ON ERROR:
@@ -113,6 +154,28 @@ import type {
 } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TASK 3: Engine-lock error class
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Thrown by `executeAtomicAction` when a mutation is attempted while the
+ * genome engine is currently ingesting a file (isProcessing === true).
+ *
+ * Exported so callers can branch on `err instanceof EngineLockError` to
+ * display a "please wait for the load to complete" notice rather than a
+ * generic error banner.
+ */
+export class EngineLockError extends Error {
+  readonly code = 'ENGINE_LOCK_ERROR' as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'EngineLockError';
+    Object.setPrototypeOf(this, EngineLockError.prototype);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Initial chronos state
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -153,21 +216,36 @@ export const createChronosSlice: StateCreator<
   ChronosSlice
 > = (set, get) => {
 
-  // ── MX-01: Internal atomic execution wrapper ────────────────────────────────
+  // ── MX-01 + TASK 3: Internal atomic execution wrapper ──────────────────────
   //
   // This function is NOT exposed on the store.  It is a closure-scoped helper
   // that serialises all calls to undo(), redo(), and applyLocalMutation().
   //
   // HOW IT WORKS
   // ─────────────
-  //  1. Read the current tail of the queue from the store.
-  //  2. Build `chainedTask`: a new promise that waits for the previous tail,
+  //  1. [TASK 3] Read isProcessing from genomeSlice.  If true, reject immediately.
+  //  2. Read the current tail of the queue from the store.
+  //  3. Build `chainedTask`: a new promise that waits for the previous tail,
   //     sets isLocked, executes the action, then clears isLocked.
-  //  3. Store a *silenced* version of the chained task as the new queue tail.
+  //  4. Store a *silenced* version of the chained task as the new queue tail.
   //     Silencing (`.catch(() => {})`) prevents a rejection in one action from
   //     blocking all subsequent queued actions.
-  //  4. Return `chainedTask` (not the silenced version) to the caller so they
+  //  5. Return `chainedTask` (not the silenced version) to the caller so they
   //     still receive real rejections via `await`.
+  //
+  // TASK 3 — CROSS-DOMAIN MUTEX GUARD
+  // ────────────────────────────────────
+  //  The `isProcessing` flag is owned by `genomeSlice` and is set to `true`
+  //  for the entire lifetime of `loadFile` and `loadGenomeFromCloud`.
+  //
+  //  If a mutation action is enqueued while isProcessing is true, it is
+  //  rejected BEFORE being appended to the action queue.  This is intentional:
+  //  we do not want the mutation to be deferred until after the load completes,
+  //  because the researcher's intent may have changed by then.  A hard rejection
+  //  with a clear error message is the safer behaviour.
+  //
+  //  The rejection does NOT break the queue — the `.catch(() => {})` shim
+  //  is written as the new tail even on the rejection path.
   //
   // ORDERING GUARANTEE
   // ───────────────────
@@ -185,11 +263,50 @@ export const createChronosSlice: StateCreator<
   //  has already been committed to the store.
   //
   const executeAtomicAction = (action: () => Promise<void>): Promise<void> => {
-    // Capture the current queue tail synchronously.
+
+    // ── TASK 3: Cross-domain mutex — check genomeSlice.isProcessing ─────────
+    //
+    // Read the flag synchronously *before* touching the action queue.  If the
+    // genome engine is currently streaming a file, reject immediately with a
+    // descriptive EngineLockError and write a System Log entry so the
+    // researcher sees the reason in the terminal panel.
+    //
+    // NOTE: We read isProcessing here (before the .then() callback) so that
+    // the check happens at the moment the caller initiates the action, not
+    // after the previous queue item finishes.  A stream that starts after this
+    // check but before the action executes is theoretically possible, but is
+    // mitigated by the SI-01 watchdog in genomeSlice which prevents isProcessing
+    // from being held for longer than 45 seconds.
+    const { isProcessing } = get();
+
+    if (isProcessing) {
+      const lockMsg = 'Engine Locked: Cannot mutate while streaming genome.';
+
+      get().addSystemLog({
+        timestamp: Date.now(),
+        category : 'CHRONOS',
+        message  : `⚠️ ${lockMsg}`,
+        level    : 'warning',
+      });
+
+      // Build a rejected chainedTask so the silenced tail can be stored
+      // (maintaining queue continuity) while the original rejection is
+      // returned to the caller.
+      const rejected = Promise.reject(new EngineLockError(lockMsg));
+
+      // Store silenced version as new queue tail so subsequent queued actions
+      // are not starved by this rejection.
+      set({ actionQueue: rejected.catch(() => {}) });
+
+      // Return the non-silenced rejection to the caller.
+      return rejected;
+    }
+
+    // ── MX-01: Capture the current queue tail synchronously ─────────────────
     const previousQueue = get().actionQueue;
 
     // Build the chained task.  Errors from the previous item are swallowed by
-    // the `.catch(() => {})` on the stored tail (see step 3), so `previousQueue`
+    // the `.catch(() => {})` on the stored tail (see step 4), so `previousQueue`
     // here is always a resolving promise — the `.then()` will always fire.
     const chainedTask: Promise<void> = previousQueue
       .then(async () => {
@@ -198,7 +315,7 @@ export const createChronosSlice: StateCreator<
 
         // Step 2: Execute the caller-provided async action.
         //   This may throw — the throw propagates to `chainedTask`'s rejection
-        //   handler (the caller), but NOT into the queue tail (step 3 below).
+        //   handler (the caller), but NOT into the queue tail (step 4 below).
         await action();
       })
       .finally(() => {
@@ -235,6 +352,9 @@ export const createChronosSlice: StateCreator<
      *
      * MX-01: Wrapped in executeAtomicAction so concurrent calls are serialised
      * and cannot interleave with an in-flight undo or redo.
+     *
+     * TASK 3: executeAtomicAction will throw EngineLockError (and write a System
+     * Log) if genomeSlice.isProcessing is true at call time.
      */
     applyLocalMutation: (
       slabIndex: number,
@@ -356,6 +476,9 @@ export const createChronosSlice: StateCreator<
      * from the worker because it only starts after the previous call's GET_HEAD
      * and requestViewport round-trips have fully completed.
      *
+     * TASK 3: executeAtomicAction will throw EngineLockError if the genome is
+     * currently being loaded/streamed.
+     *
      * ── LB-06 FIX: Immediate chronosHead advancement ──────────────────────────
      * PROBLEM (offline + online race):
      *   The old implementation left `chronosHead` pointing at the *undone*
@@ -445,6 +568,9 @@ export const createChronosSlice: StateCreator<
      * LB-06 and CF-04 semantics are identical to undo() — see that method's
      * JSDoc for the full rationale.  Mirroring undo() exactly ensures consistent
      * behaviour in both directions of the history timeline.
+     *
+     * TASK 3: executeAtomicAction will throw EngineLockError if the genome is
+     * currently being loaded/streamed.
      */
     redo: (): Promise<void> => {
       return executeAtomicAction(async () => {

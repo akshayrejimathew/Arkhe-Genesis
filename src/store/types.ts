@@ -1,5 +1,13 @@
 /**
- * src/store/types.ts
+ *
+ * ── SPRINT 2 CHANGES ─────────────────────────────────────────────────────────
+ *   TASK 2: UI State Persistence
+ *     • `themeMode` added to UIState (default 'abyssal')
+ *     • `setThemeMode` added to UIActions
+ *     • StoreMutators updated to include zustand/persist so StateCreator
+ *       declarations in every slice remain correctly typed after index.ts
+ *       wraps the store with persist(subscribeWithSelector(...)).
+ * ─────────────────────────────────────────────────────────────────────────────
  *
  * ── PURPOSE ──────────────────────────────────────────────────────────────────
  * Single source of truth for every type that crosses slice boundaries.
@@ -13,12 +21,12 @@
  *  4. Domain-type re-exports so slices only import from one place
  *
  * ── MIDDLEWARE TUPLE ─────────────────────────────────────────────────────────
- * The store uses subscribeWithSelector.  Every StateCreator that needs access
- * to the full store should be declared as:
+ * The store uses subscribeWithSelector (outer) wrapping persist (inner).
+ * Every StateCreator that needs access to the full store should be declared as:
  *
  *   StateCreator<ArkheState, Mutators, [], YourSlice>
  *
- * where Mutators = [['zustand/subscribeWithSelector', never]]
+ * where Mutators = StoreMutators (see § 4 below).
  */
 
 // ── Third-party ───────────────────────────────────────────────────────────────
@@ -161,31 +169,16 @@ export interface GenomeState {
   diffMode: boolean;
 
   // ── FR-01: Frozen Recovery — slab ↔ cloud state tracking ─────────────────
-  //
-  // isRealigning
-  //   Set to true the moment COMMIT_SYNC detects a txId mismatch between the
-  //   worker's SlabManager and the authoritative cloud HEAD. Cleared once
-  //   loadGenomeFromCloud() completes the full recovery re-load.
-  //   SequenceView uses this as the PRIMARY guard signal to show the
-  //   "Re-aligning Memory..." overlay instead of rendering stale buffer data.
-  //
-  // slabVersion
-  //   Mirrors SlabManager.slabVersion. Incremented by 1 on every
-  //   SlabManager.hardReset() call. Starts at 0. The store reflects this value
-  //   immediately when the worker reports 'hard_reset_required' from
-  //   VERIFY_SLAB_STATE. Used as a SECONDARY guard signal in SequenceView
-  //   (slabVersion !== slabAcknowledgedVersion).
-  //
-  // slabAcknowledgedVersion
-  //   The slabVersion value at the time the last successful setViewportData()
-  //   ran. Normally equals slabVersion. Diverges from slabVersion only in the
-  //   window between a hard reset and the first successful requestViewport()
-  //   call after the reset. Cleared (back to equality with slabVersion) by
-  //   setViewportData() and by the end of loadGenomeFromCloud().
-  //
   isRealigning: boolean;
   slabVersion: number;
   slabAcknowledgedVersion: number;
+
+  /**
+   * SPRINT 2 FIX (TASK 1) — Race-condition lock.
+   * True while loadFile or loadGenomeFromCloud is executing.
+   * Any concurrent call to either method is rejected with a SystemLog warning.
+   */
+  isProcessing: boolean;
 }
 
 export interface GenomeActions {
@@ -198,7 +191,7 @@ export interface GenomeActions {
   loadGenomeFromCloud: (genomeId: string) => Promise<void>;
 
   // Viewport
-  requestViewport: (start: number, end: number) => Promise<SliceResponse>;
+  requestViewport: (start: number, end: number) => Promise<SliceResponse | null>;
   fetchGenomeMetadata: () => Promise<{ genomeLength: number; slabMetas: SlabMeta[] }>;
 
   // Feature map
@@ -275,6 +268,8 @@ export interface GenomeActions {
 
   // FR-01: Frozen Recovery — realignment flag setter
   setIsRealigning: (realigning: boolean) => void;
+  /** SPRINT 2 FIX: Manual override for the race-condition lock (testing/recovery). */
+  setIsProcessing: (processing: boolean) => void;
 }
 
 /** Full genome slice type consumed by StateCreator. */
@@ -304,18 +299,6 @@ export interface ChronosState {
   foldError: string | null;
 
   // ── Async Mutex (MX-01) ────────────────────────────────────────────────────
-  //
-  // `isLocked` — true while any atomic action (undo, redo, applyLocalMutation)
-  //   is executing. Components read this to display a loading / disabled state
-  //   so the user cannot trigger a second action before the first completes.
-  //
-  // `actionQueue` — the tail of the currently-chained promise queue.
-  //   Each new atomic action appends itself via .then() so that actions are
-  //   processed strictly one-by-one in submission order.  This field is a
-  //   plain Promise<void> stored in Zustand; it is intentionally excluded from
-  //   devtools serialisation (it is non-serialisable).  Components should
-  //   never read this field directly — use `isLocked` instead.
-  //
   isLocked: boolean;
   actionQueue: Promise<void>;
 }
@@ -386,6 +369,10 @@ export type ChronosSlice = ChronosState & ChronosActions;
 // ── § 2c · UI slice ───────────────────────────────────────────────────────────
 
 export interface UIState {
+  // ── SPRINT 2: Theme mode (persisted) ───────────────────────────────────────
+  /** The active colour theme. Persisted to 'arkhe-ui-storage' via Zustand persist. */
+  themeMode: 'abyssal' | 'cleanroom';
+
   // Auth
   user: User | null;
   userId: string | null;
@@ -412,9 +399,19 @@ export interface UIState {
   terminalInput: string;
   isExecuting: boolean;
   terminalLogs: SystemLog[];
+
+  // ── SPRINT 3 TASK 4: Interactive Guide Hook ──────────────────────────────────
+  /** True on first visit / signup; drives onboarding entry. */
+  userIsNew: boolean;
+  /** Whether the onboarding overlay is currently active. */
+  onboardingActive: boolean;
 }
 
 export interface UIActions {
+  // ── SPRINT 2: Theme ─────────────────────────────────────────────────────────
+  /** Persist-aware theme setter. Updates the store and is rehydrated on boot. */
+  setThemeMode: (theme: 'abyssal' | 'cleanroom') => void;
+
   // Auth
   setUser: (user: User | null) => void;
   clearUser: () => void;
@@ -455,6 +452,11 @@ export interface UIActions {
   addTerminalOutput: (line: string) => void;
   setExecuting: (executing: boolean) => void;
   setThreatMatches: (matches: ThreatMatch[]) => void;
+
+  // ── SPRINT 3 TASK 4: Interactive Guide Hook ──────────────────────────────────
+  setUserIsNew: (isNew: boolean) => void;
+  startOnboarding: () => void;
+  stopOnboarding: () => void;
 }
 
 /** Full UI slice type consumed by StateCreator. */
@@ -462,10 +464,6 @@ export type UISlice = UIState & UIActions;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 3 · ArkheState — the full merged store interface
-//
-// This is the type passed as the FIRST generic to StateCreator<ArkheState, …>
-// in every slice file.  It is the intersection of all slice types so that
-// get() inside any slice returns a fully-typed combined state.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type ArkheState = GenomeSlice & ChronosSlice & UISlice;
@@ -473,18 +471,25 @@ export type ArkheState = GenomeSlice & ChronosSlice & UISlice;
 // ─────────────────────────────────────────────────────────────────────────────
 // § 4 · Convenience Middleware tuple alias
 //
-// Paste this alias into StateCreator declarations to avoid repeating the
-// verbose subscribeWithSelector middleware tuple everywhere.
+// SPRINT 2: Updated to include zustand/persist because index.ts now wraps the
+// store as:  create()(subscribeWithSelector(persist(...slices, options)))
+//
+// The order here matches the middleware application order (outermost first):
+//   subscribeWithSelector  →  outer
+//   persist                →  inner (wraps the raw StateCreators directly)
+//
+// All three slice StateCreators are declared as:
+//   StateCreator<ArkheState, StoreMutators, [], MySlice>
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Middleware mutators for a store that wraps subscribeWithSelector. */
-export type StoreMutators = [['zustand/subscribeWithSelector', never]];
+/** Middleware mutators for a store that uses subscribeWithSelector + persist. */
+export type StoreMutators = [
+  ['zustand/subscribeWithSelector', never],
+  ['zustand/persist', unknown],
+];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 5 · Domain-type re-exports
-//
-// Slices import domain types from here rather than from deep package paths,
-// keeping import graphs shallow and refactor-friendly.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type {
@@ -517,26 +522,9 @@ export type {
 };
 
 /**
- * TransactionSummary — add this to src/store/types.ts
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * This interface must be exported from src/store/types.ts so that both
- * chronosSlice.ts and genomeSlice.ts can import it. If it is already present
- * under a different name, update the import in both slice files accordingly.
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * PURPOSE:
- *   Lightweight summary of a Chronos transaction pushed to the UI via the
- *   CHRONOS_HISTORY worker message. Distinct from a full Commit — it carries
- *   only the fields needed to render the history panel without transmitting
- *   the entire MutationRecord[].
- *
- * CONTEXT (LB-10 fix):
- *   The CHRONOS_HISTORY worker message handler in genomeSlice.ts was previously
- *   typed as `payload as Parameters<typeof get>`, which resolves to `[]` — a
- *   zero-arg tuple. TypeScript accepted the cast silently but it was semantically
- *   wrong. The correct type is `TransactionSummary[]`, which this interface
- *   provides. Both chronosSlice.ts and genomeSlice.ts now import it explicitly.
+ * TransactionSummary — lightweight summary of a Chronos transaction for
+ * history views. Distinct from a full Commit — carries only the fields
+ * needed to render the history panel.
  */
 export interface TransactionSummary {
   /** The unique transaction ID produced by Chronos.generateTxId(). */

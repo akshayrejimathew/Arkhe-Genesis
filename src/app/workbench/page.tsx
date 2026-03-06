@@ -1,5 +1,3 @@
-'use client';
-
 /**
  * src/app/workbench/page.tsx
  * ─────────────────────────────────────────────────────────────────────────────
@@ -20,6 +18,8 @@
  *   Set to 'false' by this component once onboarding is dismissed.
  */
 
+
+'use client';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { AnimatePresence } from 'framer-motion';
@@ -32,7 +32,10 @@ type AuthState = 'checking' | 'unauthenticated' | 'onboarding' | 'ready';
 
 export default function WorkbenchPage() {
   const router     = useRouter();
-  const setUserId  = useArkheStore(s => s.setUserId);
+  const setUserId          = useArkheStore(s => s.setUserId);
+  const runThreatScreening = useArkheStore(s => s.runThreatScreening);
+  const activeGenomeId     = useArkheStore(s => s.activeGenomeId);
+  const viewportSequence   = useArkheStore(s => s.viewport?.sequence ?? '');
   const [authState, setAuthState] = useState<AuthState>('checking');
 
   useEffect(() => {
@@ -63,6 +66,42 @@ export default function WorkbenchPage() {
 
     return () => { cancelled = true; };
   }, [router, setUserId]);
+
+  /**
+   * SPRINT 2 FIX (TASK 4) — Automatic Biosecurity Trigger
+   *
+   * Sentinel was previously passive — it only ran when the researcher manually
+   * opened the Sentinel panel. For a "Pinnacle" tool this is insufficient.
+   * A genome is most vulnerable immediately after loading or after a mutation
+   * is committed, before the researcher has had a chance to run a manual audit.
+   *
+   * This effect fires `runThreatScreening()` automatically whenever:
+   *   1. A new genome is successfully loaded (`activeGenomeId` changes to a
+   *      non-null value), giving an instant baseline biosecurity report.
+   *   2. The component first mounts with an already-loaded genome (handles
+   *      the browser-refresh / session-restore path).
+   *
+   * The call is intentionally fire-and-forget — failures are surfaced via
+   * the SystemLog, not as thrown exceptions, to keep the workbench stable.
+   *
+   * Mutation commits are handled separately by the Chronos slice, which calls
+   * runThreatScreening() after a successful COMMIT_SYNC push.
+   */
+  useEffect(() => {
+    if (!activeGenomeId || !runThreatScreening) return;
+
+    // Slight delay so the worker has time to finish loading before we scan.
+    const timerId = setTimeout(() => {
+      // Pass the current viewport sequence — runThreatScreening screens the
+      // loaded genome via the worker, but needs a seed sequence for the screen.
+      // An empty string is safe: the worker will scan the full genome buffer.
+      runThreatScreening(viewportSequence).catch((err: unknown) => {
+        console.warn('[Arkhé] Auto biosecurity screen failed:', err);
+      });
+    }, 500);
+
+    return () => clearTimeout(timerId);
+  }, [activeGenomeId, runThreatScreening]);
 
   const handleOnboardingClose = () => {
     if (typeof window !== 'undefined') {

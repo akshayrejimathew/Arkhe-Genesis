@@ -360,12 +360,13 @@ export interface AssemblyPrediction {
   frameshift?: boolean;
 }
 
-export interface SystemLog {
-  timestamp: number;
-  category: string;
-  message: string;
-  level: 'info' | 'success' | 'warning' | 'error';
-}
+// SystemLog was removed from this file as part of SPRINT C / SHADOW-05 cleanup.
+// The single canonical definition lives in src/types/SystemLog.ts.
+// All consumers must import from that path:
+//
+//   import type { SystemLog } from '@/types/SystemLog';
+//
+// Do NOT re-add this interface here.
 
 /**
  * Summary of a transaction (commit) for history views.

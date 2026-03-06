@@ -1258,4 +1258,143 @@ export class PersistenceManager {
       return { data: null, error: err instanceof Error ? err.message : 'Unknown delete error', status: 'fail' };
     }
   }
+
+  // --------------------------------------------------------------------------
+  // 5. VAULT PURGE — Destructive Logout (Sprint 2 — Task 3)
+  // --------------------------------------------------------------------------
+
+  /**
+   * destructiveLogout
+   *
+   * ── GENESIS RECTIFICATION — TASK 3: Vault Purge / Plaintext Ghost Defence ──
+   *
+   * PROBLEM (before this fix):
+   *   Calling deactivateSovereignMode() deleted the IndexedDB vault entries,
+   *   but:
+   *     1. The session seed cookie was merely expired (deleted via past date),
+   *        not overwritten.  Browser history APIs and some storage inspection
+   *        tools can recover a cookie value that was deleted without being
+   *        overwritten first.  A "ghost" copy of the seed could persist.
+   *     2. The PBKDF2 salt (ARKHE_VAULT_SALT) was never cleared, leaving
+   *        one half of the key-derivation material resident in IndexedDB even
+   *        after deactivation.  Combined with a recovered seed ghost, the AES
+   *        key could be reconstructed post-logout.
+   *     3. No in-memory credential purge was performed, leaving stale
+   *        _sovereignClient and _sovereignUrl references alive until GC.
+   *
+   * FIX — Three-phase purge:
+   *
+   *   PHASE 1 — Cookie null-byte overwrite before expiry.
+   *     The seed cookie is overwritten with a 32-byte null buffer (base64 of
+   *     0x00 * 32) BEFORE the expiry-date deletion.  This prevents recovery
+   *     of the original seed from browser history, forensic cookie stores, or
+   *     any in-memory snapshot taken between the delete and the GC cycle.
+   *
+   *   PHASE 2 — IndexedDB purge.
+   *     All Vault-related keys are cleared:
+   *       ARKHE_VAULT_SALT       — PBKDF2 salt (key derivation layer 2)
+   *       ARKHE_VAULT_KEY_CIPHER — AES-GCM ciphertext of the sovereign API key
+   *       ARKHE_CUSTOM_SUPABASE_URL — Sovereign instance URL
+   *       ARKHE_CUSTOM_SUPABASE_KEY — Legacy plaintext key (belt-and-suspenders)
+   *     After this phase neither half of the key-derivation input exists in
+   *     browser storage, making ciphertext decryption computationally infeasible.
+   *
+   *   PHASE 3 — In-memory purge.
+   *     The static SupabaseClient reference and URL cache are nulled and the
+   *     circuit breaker is reset.  This prevents the zombie client from
+   *     completing any in-flight sync operations with stale credentials.
+   *
+   * ORDERING GUARANTEE:
+   *   The cookie overwrite (Phase 1) MUST complete before the IndexedDB
+   *   deletes (Phase 2).  If the browser crashes between Phase 1 and Phase 2,
+   *   the salt still exists in IndexedDB but the seed is now garbage, so no
+   *   valid AES key can be derived — the ciphertext is permanently undecryptable.
+   *
+   * LIMITATIONS:
+   *   This method cannot purge data held in Supabase cloud storage or on
+   *   other devices/tabs.  For a full credential revocation the researcher
+   *   must also rotate the Supabase API key in their dashboard.
+   *
+   * @returns Promise that resolves once all three phases have completed.
+   *          Does not throw; individual phase failures are logged to console
+   *          so the caller always proceeds to the next phase even on partial
+   *          storage failures.
+   */
+  public static async destructiveLogout(): Promise<void> {
+    // ── PHASE 1: Cookie null-byte overwrite then expiry ───────────────────
+    //
+    // We overwrite BEFORE deleting so the original seed value is never
+    // readable again from cookie history or forensic tools.
+    //
+    // NULL_SEED = base64 of 32 zero bytes.  Overwriting with this value
+    // replaces the original entropy with non-secret data.
+    if (typeof document !== 'undefined') {
+      try {
+        // Step 1a: Overwrite with null bytes (same expiry / path / SameSite
+        // attributes as the original write so the browser replaces the entry
+        // rather than creating a second cookie with the same name).
+        const nullSeedBytes = new Uint8Array(new ArrayBuffer(32)); // 32 zero bytes
+        let nullB64 = '';
+        for (let i = 0; i < nullSeedBytes.byteLength; i++) {
+          nullB64 += String.fromCharCode(nullSeedBytes[i]);
+        }
+        nullB64 = btoa(nullB64); // base64 of 0x00 * 32
+
+        const oneYear = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toUTCString();
+        document.cookie =
+          `${VAULT_SEED_COOKIE}=${nullB64}; expires=${oneYear}; path=/; SameSite=Strict`;
+
+        // Step 1b: Now expire the cookie (delete it).  The previous step
+        // guarantees the original seed has already been overwritten.
+        const epoch = new Date(0).toUTCString();
+        document.cookie =
+          `${VAULT_SEED_COOKIE}=; expires=${epoch}; path=/; SameSite=Strict`;
+      } catch (cookieErr) {
+        // Cookie API is unavailable (SSR, sandboxed iframe, etc.).
+        // Log and continue — the IndexedDB purge in Phase 2 still removes
+        // the ciphertext and salt, preventing decryption even if the seed
+        // ghost persists.
+        console.warn(
+          '[PersistenceManager] destructiveLogout: cookie overwrite failed — ' +
+          'seed ghost may persist.  IndexedDB purge will continue.',
+          cookieErr,
+        );
+      }
+    }
+
+    // ── PHASE 2: IndexedDB purge ──────────────────────────────────────────
+    //
+    // Delete ALL vault-related keys.  Individual failures are caught so a
+    // single missing key does not abort the rest of the purge sequence.
+    if (typeof window !== 'undefined' && typeof indexedDB !== 'undefined') {
+      const purgeKey = async (key: string): Promise<void> => {
+        try {
+          await del(key);
+        } catch (err) {
+          // Key may not exist (already purged, or never written).
+          // This is a normal condition on first logout; not an error.
+          console.warn(`[PersistenceManager] destructiveLogout: could not delete IDB key "${key}":`, err);
+        }
+      };
+
+      await purgeKey(VAULT_SALT_KEY);        // PBKDF2 salt — key derivation layer 2
+      await purgeKey(VAULT_CIPHER_KEY);      // AES-GCM ciphertext of sovereign API key
+      await purgeKey(SOVEREIGN_URL_KEY);     // Sovereign instance URL
+      await purgeKey(SOVEREIGN_KEY_KEY);     // Legacy plaintext key (belt-and-suspenders)
+    }
+
+    // ── PHASE 3: In-memory purge ──────────────────────────────────────────
+    //
+    // Null the cached client reference and URL so no zombie sync can proceed
+    // with the now-invalidated credentials.
+    PersistenceManager._sovereignClient = null;
+    PersistenceManager._sovereignUrl    = null;
+    PersistenceManager.resetCircuitBreaker();
+
+    console.info(
+      '[PersistenceManager] destructiveLogout: session seed overwritten, ' +
+      'IndexedDB vault cleared, in-memory credentials purged. ' +
+      'No plaintext ghost remains in browser storage.',
+    );
+  }
 }

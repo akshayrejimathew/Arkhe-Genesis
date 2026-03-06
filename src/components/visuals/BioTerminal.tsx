@@ -13,11 +13,18 @@
  *   • Log entries enter with a minimal 80ms fade-in-right — clinical, not theatrical.
  *   • NO CRT flicker / scanlines — those were retro aesthetics, now removed.
  *   • Glass topbar with backdrop-blur for depth without heaviness.
+ *
+ * ── GENESIS RECTIFICATION SPRINT 3 — ABYSSAL UX ─────────────────────────────
+ *   TASK 1: Virtualized log list via `react-virtuoso` — only 30 visible lines
+ *           are rendered, even with 10,000 entries.
+ *   TASK 3: `will-change: transform` applied to the terminal container,
+ *           offloading blur/chromatic aberration effects to the GPU.
  * ──────────────────────────────────────────────────────────────────────────────
  */
 
 import { useEffect, useRef, useState, useCallback, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { Virtuoso } from 'react-virtuoso';
 import { Terminal, Trash2, Download, Copy, ChevronDown, X } from 'lucide-react';
 import { clsx } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -26,8 +33,9 @@ import type { SystemLog } from '@/store/types';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));
 
+const ITEM_HEIGHT = 24; // Height of each log entry in pixels
+
 // ─── Level color tokens ───────────────────────────────────────────────────────
-// Deliberately restrained — no neon saturation against the abyssal ground.
 const LEVEL_COLOR: Record<SystemLog['level'], string> = {
   info:    '#94A3B8',   // slate-400
   success: '#4ADE80',   // green-400
@@ -36,7 +44,6 @@ const LEVEL_COLOR: Record<SystemLog['level'], string> = {
   debug:   '#475569',   // slate-600
 };
 
-// Ambient glow (subtle — reinforces the message weight, not the decoration)
 const LEVEL_GLOW: Record<SystemLog['level'], string> = {
   info:    '',
   success: 'drop-shadow-[0_0_5px_rgba(74,222,128,0.40)]',
@@ -45,7 +52,6 @@ const LEVEL_GLOW: Record<SystemLog['level'], string> = {
   debug:   '',
 };
 
-// Level indicator dot
 const LEVEL_DOT: Record<SystemLog['level'], string> = {
   info:    '#38BDF8',
   success: '#4ADE80',
@@ -67,7 +73,6 @@ const CATEGORY_COLOR: Record<SystemLog['category'], string> = {
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function formatTs(ts: number): string {
   const d = new Date(ts);
   return (
@@ -78,8 +83,7 @@ function formatTs(ts: number): string {
   );
 }
 
-// ─── LogEntry ─────────────────────────────────────────────────────────────────
-
+// ─── LogEntry (memoized, used by Virtuoso) ────────────────────────────────────
 const LogEntry = memo(function LogEntry({
   log,
   index,
@@ -147,7 +151,6 @@ const LogEntry = memo(function LogEntry({
 });
 
 // ─── Empty state ──────────────────────────────────────────────────────────────
-
 function TerminalEmpty() {
   return (
     <div className="flex flex-col items-center justify-center h-full pb-8 select-none">
@@ -180,16 +183,14 @@ function TerminalEmpty() {
 }
 
 // ─── Props ────────────────────────────────────────────────────────────────────
-
 interface BioTerminalProps {
   isCollapsed?: boolean;
   onToggle?:    () => void;
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
-
 export default function BioTerminal({ isCollapsed = false, onToggle }: BioTerminalProps) {
-  const scrollRef   = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<any>(null);
   const inputRef    = useRef<HTMLInputElement>(null);
   const [input,      setInput]      = useState('');
   const [history,    setHistory]    = useState<string[]>([]);
@@ -200,18 +201,20 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
   const clearTerminalLogs = useArkheStore((s: ArkheState) => s.clearTerminalLogs);
   const executeCommand    = useArkheStore((s) => s.executeTerminalCommand);
 
-  // ── Auto-scroll ───────────────────────────────────────────────────────────
+  // ── Auto-scroll when new logs arrive ─────────────────────────────────────
   useEffect(() => {
-    if (autoScroll && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (autoScroll && virtuosoRef.current && terminalLogs.length > 0) {
+      virtuosoRef.current.scrollToIndex({
+        index: terminalLogs.length - 1,
+        behavior: 'smooth',
+      });
     }
   }, [terminalLogs, autoScroll]);
 
   // Detect manual scroll — disable auto-scroll
-  const handleScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+  const handleScroll = useCallback((e: any) => {
+    const { scrollTop, scrollHeight, viewportHeight } = e;
+    const atBottom = scrollHeight - scrollTop - viewportHeight < 30;
     setAutoScroll(atBottom);
   }, []);
 
@@ -269,9 +272,14 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
 
   // ── Scroll to bottom button ───────────────────────────────────────────────
   const scrollToBottom = useCallback(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-    setAutoScroll(true);
-  }, []);
+    if (virtuosoRef.current) {
+      virtuosoRef.current.scrollToIndex({
+        index: terminalLogs.length - 1,
+        behavior: 'smooth',
+      });
+      setAutoScroll(true);
+    }
+  }, [terminalLogs.length]);
 
   return (
     <div
@@ -279,7 +287,10 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
         'w-full h-full flex flex-col overflow-hidden relative',
         isCollapsed && 'w-0',
       )}
-      style={{ background: '#020617' }}
+      style={{
+        background: '#020617',
+        willChange: 'transform', // TASK 3: GPU offload
+      }}
     >
       {/* ── Glass header ─────────────────────────────────────────────────── */}
       <div
@@ -293,10 +304,7 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
         }}
       >
         <div className="flex items-center gap-2">
-          <Terminal
-            size={13}
-            style={{ color: '#38BDF8' }}
-          />
+          <Terminal size={13} style={{ color: '#38BDF8' }} />
           <span
             className="text-[11px] font-semibold"
             style={{ color: '#E2E8F0', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
@@ -358,26 +366,27 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
         </div>
       </div>
 
-      {/* ── Log output ───────────────────────────────────────────────────── */}
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        className="flex-1 overflow-y-auto py-2 min-h-0"
-        style={{ background: '#020617' }}
-        onClick={() => inputRef.current?.focus()}
-      >
+      {/* ── Log output (virtualized) ─────────────────────────────────────── */}
+      <div className="flex-1 overflow-hidden" style={{ background: '#020617' }}>
         {terminalLogs.length === 0 ? (
           <TerminalEmpty />
         ) : (
-          terminalLogs.map((log, i) => (
-            <LogEntry key={`${log.timestamp}-${i}`} log={log} index={i} />
-          ))
+          <Virtuoso
+            ref={virtuosoRef}
+            data={terminalLogs}
+            totalCount={terminalLogs.length}
+            fixedItemHeight={ITEM_HEIGHT}
+            itemContent={(index, log) => <LogEntry log={log} index={index} />}
+            onScroll={handleScroll}
+            overscan={200} // render a few extra items for smooth scrolling
+            style={{ height: '100%', width: '100%' }}
+          />
         )}
       </div>
 
       {/* ── Scroll-to-bottom button ───────────────────────────────────────── */}
       <AnimatePresence>
-        {!autoScroll && (
+        {!autoScroll && terminalLogs.length > 0 && (
           <motion.button
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}

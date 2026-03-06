@@ -1,6 +1,37 @@
 /**
  * src/store/index.ts
  *
+ * ── SPRINT 2 CHANGES ─────────────────────────────────────────────────────────
+ *   TASK 2: UI State Persistence
+ *     • persist middleware imported from 'zustand/middleware'.
+ *     • The combined StateCreator is wrapped with persist (inside
+ *       subscribeWithSelector) so that the three fields below survive
+ *       a page reload:
+ *
+ *         themeMode      — user's chosen Abyssal / Clean Room theme
+ *         terminalLogs   — system log ring buffer
+ *         terminalOutput — raw terminal output lines
+ *
+ *     • Storage key: 'arkhe-ui-storage'
+ *     • partialize() strips all genome / chronos state — only the named UI
+ *       fields are written to localStorage, keeping the payload tiny and
+ *       avoiding non-serialisable fields (Worker, ArrayBuffer, Promises).
+ *
+ * ── Middleware stack (outer → inner) ──────────────────────────────────────────
+ *
+ *   create<ArkheState>()(
+ *     subscribeWithSelector(       ← adds .subscribe(selector, callback) API
+ *       persist(                   ← serialises partialised state to localStorage
+ *         (...args) => ({          ← combined StateCreator
+ *           ...genomeSlice,
+ *           ...chronosSlice,
+ *           ...uiSlice,
+ *         }),
+ *         { name, partialize }
+ *       )
+ *     )
+ *   )
+ *
  * ── PURPOSE ──────────────────────────────────────────────────────────────────
  * Barrel that assembles the three Zustand slices into the single unified
  * `useArkheStore` hook that every component in the application imports.
@@ -8,63 +39,10 @@
  * The public API of this file is IDENTICAL to the original monolithic
  * useArkheStore.ts — every hook selector is re-exported with its original
  * name so no component import needs to change.
- *
- * ── ASSEMBLY PATTERN ─────────────────────────────────────────────────────────
- *
- *   create<ArkheState>()(
- *     subscribeWithSelector((...args) => ({
- *       ...createGenomeSlice(...args),
- *       ...createChronosSlice(...args),
- *       ...createUISlice(...args),
- *     }))
- *   )
- *
- * Each slice factory receives the same (set, get, api) triplet.  Because all
- * three factories are typed StateCreator<ArkheState, …>, set() and get() see
- * the full combined state — cross-slice calls are type-safe and have no
- * circular import paths.
- *
- * ── SPREAD ORDER ─────────────────────────────────────────────────────────────
- *
- *   1. genomeSlice  — worker, file I/O, viewport, simulation, slab management
- *   2. chronosSlice — mutations, undo/redo, branching, off-target radar,
- *                     protein folding
- *   3. uiSlice      — auth, sovereign mode, sentinel, terminal, system logging
- *
- * Fields that appear in multiple slice initial states (orfScanResult,
- * isORFScanning) initialise to the same null / false default in all slices;
- * the last spread wins at runtime, which is fine.  Action implementations are
- * NOT duplicated — each action is defined in exactly one slice.
- *
- * ── SUBSCRIBEWITSSELECTOR MIDDLEWARE ─────────────────────────────────────────
- *
- * subscribeWithSelector enables granular field subscriptions via
- * useArkheStore.subscribe((state) => state.someField, callback)
- * without triggering re-renders for unrelated state changes.
- * The StoreMutators alias in types.ts encodes this middleware so all three
- * StateCreator declarations are correctly typed.
- *
- * ── SELECTOR PATTERN ─────────────────────────────────────────────────────────
- *
- * All exported selectors are fine-grained — they extract a single primitive
- * or stable reference — which means components only re-render when their
- * specific slice of state changes.  The naming convention is:
- *
- *   use<FieldName>  → e.g. useGenomeLength, useIsSyncing
- *
- * This matches the original monolithic export surface exactly so no component
- * imports break during the refactor.
- *
- * ── MX-01 NOTE ───────────────────────────────────────────────────────────────
- *
- * `actionQueue` is a non-serialisable Promise<void>.  It is intentionally
- * excluded from the selector surface — components should never read it
- * directly.  Use `useIsLocked` to detect whether an atomic action is in
- * flight and conditionally render a loading / disabled state.
  */
 
 import { create } from 'zustand';
-import { subscribeWithSelector } from 'zustand/middleware';
+import { subscribeWithSelector, persist } from 'zustand/middleware';
 import { createGenomeSlice } from './genomeSlice';
 import { createChronosSlice } from './chronosSlice';
 import { createUISlice } from './uiSlice';
@@ -78,14 +56,45 @@ import type { ArkheState } from './types';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const useArkheStore = create<ArkheState>()(
-  subscribeWithSelector((...args) => ({
-    // Order matters for override precedence when two slices initialise the
-    // same field.  The last spread wins.  See "Spread Order" in the file
-    // header for the rationale behind this ordering.
-    ...createGenomeSlice(...args),
-    ...createChronosSlice(...args),
-    ...createUISlice(...args),
-  })),
+  subscribeWithSelector(
+    persist(
+      (...args) => ({
+        // Order matters for override precedence when two slices initialise the
+        // same field.  The last spread wins.  See "Spread Order" in the file
+        // header for the rationale behind this ordering.
+        ...createGenomeSlice(...args),
+        ...createChronosSlice(...args),
+        ...createUISlice(...args),
+      }),
+      {
+        // ── SPRINT 2: Persistence config ──────────────────────────────────
+        name: 'arkhe-ui-storage',
+
+        /**
+         * partialize
+         *
+         * Only the three UI fields are written to localStorage. All genome,
+         * chronos, worker, and buffer state is intentionally excluded:
+         *
+         *   • Non-serialisable: Worker, ArrayBuffer, SharedArrayBuffer,
+         *     Promise (actionQueue), Map, Set — would throw on JSON.stringify.
+         *
+         *   • Stale on reload: viewport sequence, PCR results, slab metas
+         *     are derived from the engine worker and must be re-fetched on
+         *     every session — persisting them would serve stale data.
+         *
+         *   • Auth: user / userId come from Supabase's own session system
+         *     and are restored by the Supabase client on boot — no need to
+         *     duplicate them in Zustand persist storage.
+         */
+        partialize: (state) => ({
+          themeMode:      state.themeMode,
+          terminalLogs:   state.terminalLogs,
+          terminalOutput: state.terminalOutput,
+        }),
+      },
+    ),
+  ),
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,14 +130,6 @@ export const useViewportGC = () =>
 export const useViewportVersion = () =>
   useArkheStore((s) => s.viewportVersion);
 
-/**
- * Feature tags visible in the current viewport window.
- *
- * NOTE: The redundant top-level `features` array was removed in the State
- * Bloat Fix.  All feature data lives exclusively in viewport.features.
- * This selector returns an empty array (not undefined) so consumers do not
- * need to null-check.
- */
 export const useViewportFeatures = () =>
   useArkheStore((s) => s.viewport.features ?? []);
 
@@ -255,24 +256,6 @@ export const useCommits = () =>
 // § Selectors — Async Mutex (MX-01)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * useIsLocked
- *
- * Returns `true` while any atomic chronos action (undo, redo,
- * applyLocalMutation) is executing inside the sequential execution queue.
- *
- * Usage:
- *
- *   const isLocked = useIsLocked();
- *
- *   <button disabled={isLocked} onClick={undo}>
- *     {isLocked ? <Spinner /> : 'Undo'}
- *   </button>
- *
- * This selector is the ONLY intended way to observe the mutex state from
- * React components.  Do NOT read `actionQueue` from the store — it is a
- * non-serialisable Promise and is not stable across renders.
- */
 export const useIsLocked = () =>
   useArkheStore((s) => s.isLocked);
 
@@ -349,30 +332,22 @@ export const useThreatMatches = () =>
 // § Selectors — Sprint 3: Auth + Offline + Sovereign
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Full Supabase User object — null when the researcher is a guest or has not
- * signed in.  Use this in components that need email or user metadata.
- */
 export const useUser = () =>
   useArkheStore((s) => s.user);
 
-/**
- * True when the circuit breaker has tripped on a 413 or 429 response.
- * Show a banner with a "Reconnect" button that calls resetCircuitBreaker().
- */
 export const useIsOfflineMode = () =>
   useArkheStore((s) => s.isOfflineMode);
 
-/**
- * Human-readable reason why offline mode was engaged.
- * Display adjacent to the offline mode banner to explain the situation.
- */
 export const useOfflineModeReason = () =>
   useArkheStore((s) => s.offlineModeReason);
 
-/**
- * True when custom Supabase URL + key are active in localStorage.
- * Controls whether the Sovereignty Settings panel shows the "Active" badge.
- */
 export const useSovereignModeActive = () =>
   useArkheStore((s) => s.sovereignModeActive);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// § Selectors — SPRINT 2: Theme
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The active colour theme. Rehydrated from 'arkhe-ui-storage' on boot. */
+export const useThemeMode = () =>
+  useArkheStore((s) => s.themeMode);
