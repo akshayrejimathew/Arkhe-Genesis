@@ -273,7 +273,7 @@ export default function SurgicalToolbar() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className="h-14 border-b border-white/5 bg-[#0A0A0A]/80 backdrop-blur-md flex items-center justify-center px-6 z-10 flex-shrink-0">
+    <div data-tour="toolbar" className="h-14 border-b border-white/5 bg-[#0A0A0A]/80 backdrop-blur-md flex items-center justify-center px-6 z-10 flex-shrink-0">
 
       {/* ── Surgical Tools ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-2">

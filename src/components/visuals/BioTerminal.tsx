@@ -19,6 +19,16 @@
  *           are rendered, even with 10,000 entries.
  *   TASK 3: `will-change: transform` applied to the terminal container,
  *           offloading blur/chromatic aberration effects to the GPU.
+ *
+ * ── SOUL INTEGRATION SPRINT ───────────────────────────────────────────────────
+ *   TASK 1 (final): Help command → Wiki Modal redirect
+ *     • Typing "help" is intercepted BEFORE executeCommand() is called.
+ *     • Two log lines are injected:
+ *         ❯ help                      (debug / muted)
+ *         📖 Redirecting to Codex...  (success / green glow)
+ *     • openWiki() fires 80 ms later so the log lines render first.
+ *     • Placeholder updated to: "Type 'help' to begin your research..."
+ *     • Esc key clears the input field.
  * ──────────────────────────────────────────────────────────────────────────────
  */
 
@@ -33,7 +43,7 @@ import type { SystemLog } from '@/store/types';
 
 const cn = (...inputs: unknown[]) => twMerge(clsx(inputs));
 
-const ITEM_HEIGHT = 24; // Height of each log entry in pixels
+const ITEM_HEIGHT = 24; // px — height of each virtualized log row
 
 // ─── Level color tokens ───────────────────────────────────────────────────────
 const LEVEL_COLOR: Record<SystemLog['level'], string> = {
@@ -62,7 +72,7 @@ const LEVEL_DOT: Record<SystemLog['level'], string> = {
 
 // ─── Category color tokens ────────────────────────────────────────────────────
 const CATEGORY_COLOR: Record<SystemLog['category'], string> = {
-  SYSTEM:   '#38BDF8',   // accent — sky-400
+  SYSTEM:   '#38BDF8',   // sky-400
   WORKER:   '#818CF8',   // indigo-400
   MEMORY:   '#34D399',   // emerald-400
   CHRONOS:  '#A78BFA',   // violet-400
@@ -83,7 +93,7 @@ function formatTs(ts: number): string {
   );
 }
 
-// ─── LogEntry (memoized, used by Virtuoso) ────────────────────────────────────
+// ─── LogEntry (memoized, rendered by Virtuoso) ────────────────────────────────
 const LogEntry = memo(function LogEntry({
   log,
   index,
@@ -91,9 +101,9 @@ const LogEntry = memo(function LogEntry({
   log:   SystemLog;
   index: number;
 }) {
-  const color    = LEVEL_COLOR[log.level]    ?? '#94A3B8';
-  const glow     = LEVEL_GLOW[log.level]     ?? '';
-  const dotColor = LEVEL_DOT[log.level]      ?? '#334155';
+  const color    = LEVEL_COLOR[log.level]       ?? '#94A3B8';
+  const glow     = LEVEL_GLOW[log.level]        ?? '';
+  const dotColor = LEVEL_DOT[log.level]         ?? '#334155';
   const catColor = CATEGORY_COLOR[log.category] ?? '#64748B';
 
   return (
@@ -106,7 +116,7 @@ const LogEntry = memo(function LogEntry({
         'hover:bg-[rgba(255,255,255,0.025)] transition-colors duration-75 rounded-[3px]',
       )}
     >
-      {/* Level dot (visible on hover) */}
+      {/* Level dot — visible on row hover only */}
       <div
         className="w-1 h-1 rounded-full shrink-0 mt-[5px] opacity-0 group-hover:opacity-100 transition-opacity"
         style={{ background: dotColor, boxShadow: `0 0 4px ${dotColor}80` }}
@@ -115,11 +125,7 @@ const LogEntry = memo(function LogEntry({
       {/* Timestamp */}
       <span
         className="text-[10px] tabular-nums shrink-0 select-none"
-        style={{
-          color:      '#1E293B',
-          fontFamily: 'var(--font-jetbrains-mono), monospace',
-          minWidth:   '78px',
-        }}
+        style={{ color: '#1E293B', fontFamily: 'var(--font-jetbrains-mono), monospace', minWidth: '78px' }}
       >
         {formatTs(log.timestamp ?? Date.now())}
       </span>
@@ -127,11 +133,7 @@ const LogEntry = memo(function LogEntry({
       {/* Category chip */}
       <span
         className="text-[9px] font-bold uppercase tracking-[0.10em] shrink-0 select-none"
-        style={{
-          color:      catColor,
-          fontFamily: 'var(--font-jetbrains-mono), monospace',
-          minWidth:   '60px',
-        }}
+        style={{ color: catColor, fontFamily: 'var(--font-jetbrains-mono), monospace', minWidth: '60px' }}
       >
         {log.category}
       </span>
@@ -139,10 +141,7 @@ const LogEntry = memo(function LogEntry({
       {/* Message */}
       <span
         className={cn('text-[11.5px] flex-1 leading-[1.55]', glow)}
-        style={{
-          color,
-          fontFamily: 'var(--font-jetbrains-mono), monospace',
-        }}
+        style={{ color, fontFamily: 'var(--font-jetbrains-mono), monospace' }}
       >
         {log.message}
       </span>
@@ -166,11 +165,12 @@ function TerminalEmpty() {
       >
         Arkhé Genesis v1.0
       </p>
-      <p
-        className="text-[10px] mt-1.5"
+      <p className="text-[10px] mt-1.5"
         style={{ color: '#1E293B', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
       >
-        Terminal ready · awaiting system events…
+        Terminal ready · type{' '}
+        <span style={{ color: '#38BDF8' }}>&apos;help&apos;</span>
+        {' '}to begin your research…
       </p>
       <div
         className="text-[10px] uppercase tracking-[0.14em] mt-3"
@@ -192,36 +192,43 @@ interface BioTerminalProps {
 export default function BioTerminal({ isCollapsed = false, onToggle }: BioTerminalProps) {
   const virtuosoRef = useRef<any>(null);
   const inputRef    = useRef<HTMLInputElement>(null);
+
   const [input,      setInput]      = useState('');
   const [history,    setHistory]    = useState<string[]>([]);
   const [histIdx,    setHistIdx]    = useState(-1);
   const [autoScroll, setAutoScroll] = useState(true);
 
+  // ── Store subscriptions ───────────────────────────────────────────────────
   const terminalLogs     = useArkheStore((s: ArkheState) => s.terminalLogs);
   const clearTerminalLogs = useArkheStore((s: ArkheState) => s.clearTerminalLogs);
-  const executeCommand    = useArkheStore((s) => s.executeTerminalCommand);
+  const executeCommand    = useArkheStore(s => s.executeTerminalCommand);
+  const addSystemLog      = useArkheStore(s => s.addSystemLog);
 
-  // ── Auto-scroll when new logs arrive ─────────────────────────────────────
+  // SOUL INTEGRATION TASK 1 — needed to open the Wiki Modal from "help"
+  const openWiki = useArkheStore(s => s.openWiki);
+
+  // ── Auto-scroll on new log entries ───────────────────────────────────────
   useEffect(() => {
     if (autoScroll && virtuosoRef.current && terminalLogs.length > 0) {
       virtuosoRef.current.scrollToIndex({
-        index: terminalLogs.length - 1,
+        index:    terminalLogs.length - 1,
         behavior: 'smooth',
       });
     }
   }, [terminalLogs, autoScroll]);
 
-  // Detect manual scroll — disable auto-scroll
+  // ── Detect manual scroll to disable auto-scroll ──────────────────────────
   const handleScroll = useCallback((e: any) => {
     const { scrollTop, scrollHeight, viewportHeight } = e;
-    const atBottom = scrollHeight - scrollTop - viewportHeight < 30;
-    setAutoScroll(atBottom);
+    setAutoScroll(scrollHeight - scrollTop - viewportHeight < 30);
   }, []);
 
-  // ── Export ────────────────────────────────────────────────────────────────
+  // ── Export log as .log file ───────────────────────────────────────────────
   const handleExport = useCallback(() => {
     const text = terminalLogs
-      .map(l => `[${new Date(l.timestamp ?? Date.now()).toISOString()}] [${l.category}] ${l.level.toUpperCase()}: ${l.message}`)
+      .map(l =>
+        `[${new Date(l.timestamp ?? Date.now()).toISOString()}] [${l.category}] ${l.level.toUpperCase()}: ${l.message}`,
+      )
       .join('\n');
     const blob = new Blob([text], { type: 'text/plain' });
     const url  = URL.createObjectURL(blob);
@@ -232,25 +239,65 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
     URL.revokeObjectURL(url);
   }, [terminalLogs]);
 
-  // ── Copy all ──────────────────────────────────────────────────────────────
+  // ── Copy all log messages to clipboard ───────────────────────────────────
   const handleCopy = useCallback(() => {
-    const text = terminalLogs.map(l => `${l.category} ${l.message}`).join('\n');
-    navigator.clipboard.writeText(text);
+    navigator.clipboard.writeText(
+      terminalLogs.map(l => `${l.category} ${l.message}`).join('\n'),
+    );
   }, [terminalLogs]);
 
   // ── Submit command ────────────────────────────────────────────────────────
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim()) return;
-    setHistory(prev => [...prev, input]);
+    const trimmed = input.trim();
+    if (!trimmed) return;
+
+    // Push to local history and reset the history cursor
+    setHistory(prev => [...prev, trimmed]);
     setHistIdx(-1);
-    await executeCommand(input);
     setInput('');
     setAutoScroll(true);
-  }, [input, executeCommand]);
 
-  // ── History navigation ────────────────────────────────────────────────────
+    // ── SOUL INTEGRATION TASK 1: Intercept "help" ─────────────────────────
+    //
+    // Instead of forwarding to executeCommand() we:
+    //   1. Echo the typed command in debug colour (muted slate).
+    //   2. Print "📖 Redirecting to Codex..." in success colour (green glow).
+    //   3. Call openWiki() after a short delay so the log lines paint first.
+    //
+    // No worker round-trip — no engine involvement at all.
+    if (trimmed.toLowerCase() === 'help') {
+      const now = Date.now();
+
+      addSystemLog({
+        timestamp: now,
+        category:  'SYSTEM',
+        message:   `❯ ${trimmed}`,
+        level:     'debug',   // muted slate — echoed input
+      });
+
+      addSystemLog({
+        timestamp: now + 1,
+        category:  'SYSTEM',
+        message:   '📖 Redirecting to Codex...',
+        level:     'success', // green glow — confirmation
+      });
+
+      // 80 ms delay lets the two log lines render before the modal overlays
+      setTimeout(openWiki, 80);
+      return;
+    }
+
+    // ── All other commands: forward to the engine via the store ──────────
+    await executeCommand(trimmed);
+  }, [input, executeCommand, addSystemLog, openWiki]);
+
+  // ── History navigation + Esc ──────────────────────────────────────────────
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Escape') {
+      setInput('');
+      return;
+    }
     if (e.key === 'ArrowUp') {
       e.preventDefault();
       if (!history.length) return;
@@ -270,17 +317,16 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
     }
   }, [history, histIdx]);
 
-  // ── Scroll to bottom button ───────────────────────────────────────────────
+  // ── Scroll-to-bottom button handler ──────────────────────────────────────
   const scrollToBottom = useCallback(() => {
-    if (virtuosoRef.current) {
-      virtuosoRef.current.scrollToIndex({
-        index: terminalLogs.length - 1,
-        behavior: 'smooth',
-      });
-      setAutoScroll(true);
-    }
+    virtuosoRef.current?.scrollToIndex({
+      index:    terminalLogs.length - 1,
+      behavior: 'smooth',
+    });
+    setAutoScroll(true);
   }, [terminalLogs.length]);
 
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div
       className={cn(
@@ -289,18 +335,18 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
       )}
       style={{
         background: '#020617',
-        willChange: 'transform', // TASK 3: GPU offload
+        willChange: 'transform', // GPU offload for backdrop-filter children
       }}
     >
       {/* ── Glass header ─────────────────────────────────────────────────── */}
       <div
         className="flex items-center justify-between px-3 flex-shrink-0"
         style={{
-          height:       '38px',
-          background:   'rgba(13,27,46,0.85)',
-          backdropFilter: 'blur(16px)',
+          height:               '38px',
+          background:           'rgba(13,27,46,0.85)',
+          backdropFilter:       'blur(16px)',
           WebkitBackdropFilter: 'blur(16px)',
-          borderBottom: '1px solid rgba(255,255,255,0.07)',
+          borderBottom:         '1px solid rgba(255,255,255,0.07)',
         }}
       >
         <div className="flex items-center gap-2">
@@ -312,7 +358,7 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
             BioTerminal
           </span>
 
-          {/* Online indicator */}
+          {/* Online pulse indicator */}
           <div className="flex items-center gap-1.5 ml-1">
             <div
               className="w-1.5 h-1.5 rounded-full"
@@ -330,7 +376,7 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
             </span>
           </div>
 
-          {/* Log count */}
+          {/* Log entry count badge */}
           {terminalLogs.length > 0 && (
             <span
               className="px-1.5 py-0.5 rounded-[3px] text-[9px] tabular-nums"
@@ -346,13 +392,15 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
           )}
         </div>
 
-        {/* Actions */}
+        {/* Header action buttons */}
         <div className="flex items-center gap-0.5">
           {[
-            { icon: <Copy     size={12} />, fn: handleCopy,   title: 'Copy all' },
-            { icon: <Download size={12} />, fn: handleExport, title: 'Export log' },
-            { icon: <Trash2   size={12} />, fn: clearTerminalLogs, title: 'Clear' },
-            ...(onToggle ? [{ icon: <X size={12} />, fn: onToggle, title: 'Close' }] : []),
+            { icon: <Copy     size={12} />, fn: handleCopy,        title: 'Copy all'   },
+            { icon: <Download size={12} />, fn: handleExport,      title: 'Export log' },
+            { icon: <Trash2   size={12} />, fn: clearTerminalLogs, title: 'Clear'      },
+            ...(onToggle
+              ? [{ icon: <X size={12} />, fn: onToggle, title: 'Close' }]
+              : []),
           ].map((btn, i) => (
             <button
               key={i}
@@ -366,7 +414,7 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
         </div>
       </div>
 
-      {/* ── Log output (virtualized) ─────────────────────────────────────── */}
+      {/* ── Virtualized log output ───────────────────────────────────────── */}
       <div className="flex-1 overflow-hidden" style={{ background: '#020617' }}>
         {terminalLogs.length === 0 ? (
           <TerminalEmpty />
@@ -378,26 +426,26 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
             fixedItemHeight={ITEM_HEIGHT}
             itemContent={(index, log) => <LogEntry log={log} index={index} />}
             onScroll={handleScroll}
-            overscan={200} // render a few extra items for smooth scrolling
+            overscan={200}
             style={{ height: '100%', width: '100%' }}
           />
         )}
       </div>
 
-      {/* ── Scroll-to-bottom button ───────────────────────────────────────── */}
+      {/* ── Scroll-to-bottom floating button ─────────────────────────────── */}
       <AnimatePresence>
         {!autoScroll && terminalLogs.length > 0 && (
           <motion.button
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 6 }}
+            exit={{   opacity: 0, y: 6 }}
             onClick={scrollToBottom}
             className="absolute bottom-14 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full transition-all"
             style={{
-              background:  'rgba(56,189,248,0.15)',
-              border:      '1px solid rgba(56,189,248,0.30)',
+              background:     'rgba(56,189,248,0.15)',
+              border:         '1px solid rgba(56,189,248,0.30)',
               backdropFilter: 'blur(8px)',
-              boxShadow:   '0 0 12px rgba(56,189,248,0.12)',
+              boxShadow:      '0 0 12px rgba(56,189,248,0.12)',
             }}
           >
             <ChevronDown size={11} style={{ color: '#38BDF8' }} />
@@ -411,47 +459,45 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
         )}
       </AnimatePresence>
 
-      {/* ── Command input ─────────────────────────────────────────────────── */}
+      {/* ── Command input bar ────────────────────────────────────────────── */}
       <form
         onSubmit={handleSubmit}
         className="flex items-center gap-2 px-3 py-2 flex-shrink-0"
         style={{
-          background:  'rgba(13,27,46,0.80)',
-          borderTop:   '1px solid rgba(255,255,255,0.06)',
-          backdropFilter: 'blur(12px)',
+          background:           'rgba(13,27,46,0.80)',
+          borderTop:            '1px solid rgba(255,255,255,0.06)',
+          backdropFilter:       'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
         }}
       >
         {/* Prompt sigil */}
         <span
           className="text-[13px] shrink-0 select-none"
-          style={{
-            color:      '#38BDF8',
-            fontFamily: 'var(--font-jetbrains-mono), monospace',
-          }}
+          style={{ color: '#38BDF8', fontFamily: 'var(--font-jetbrains-mono), monospace' }}
         >
           ❯
         </span>
 
-        {/* Input field */}
+        {/* Text input — SOUL INTEGRATION: placeholder updated */}
         <input
           ref={inputRef}
           type="text"
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Enter command…"
+          placeholder="Type 'help' to begin your research..."
           autoComplete="off"
           spellCheck={false}
           className="flex-1 bg-transparent outline-none placeholder:text-[#1E293B]"
           style={{
-            color:       '#94A3B8',
-            fontFamily:  'var(--font-jetbrains-mono), monospace',
-            fontSize:    '12px',
-            caretColor:  '#38BDF8',
+            color:      '#94A3B8',
+            fontFamily: 'var(--font-jetbrains-mono), monospace',
+            fontSize:   '12px',
+            caretColor: '#38BDF8',
           }}
         />
 
-        {/* History hint */}
+        {/* History count hint */}
         {history.length > 0 && (
           <span
             className="text-[9.5px] tabular-nums shrink-0 select-none"
@@ -461,14 +507,14 @@ export default function BioTerminal({ isCollapsed = false, onToggle }: BioTermin
           </span>
         )}
 
-        {/* Blinking cursor decoration */}
+        {/* Blinking cursor decoration (hidden when user is typing) */}
         <span
           className="text-[12px] shrink-0 select-none"
           style={{
-            color:       '#38BDF8',
-            fontFamily:  'var(--font-jetbrains-mono), monospace',
-            animation:   'terminal-cursor 1.1s step-end infinite',
-            opacity:     input ? 0 : 1,
+            color:      '#38BDF8',
+            fontFamily: 'var(--font-jetbrains-mono), monospace',
+            animation:  'terminal-cursor 1.1s step-end infinite',
+            opacity:    input ? 0 : 1,
           }}
         >
           ▌

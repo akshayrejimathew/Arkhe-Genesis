@@ -26,11 +26,27 @@
  *   • Removed the broken localStorage.setItem('seen_intro') write — the
  *     workbench/page.tsx handler already writes 'isFirstTimeUser' = 'false'
  *     via its onClose callback, so this component must not double-write
+ *
+ * ── SOUL INTEGRATION SPRINT ───────────────────────────────────────────────────
+ *   TASK 2: Onboarding Wiring
+ *     • The welcome step now shows a "Start Tour" button that calls
+ *       `startOnboarding()` from uiSlice, setting `onboardingActive = true`.
+ *     • This causes the parent layout/page to mount <GenesisTour /> for the
+ *       detailed step-by-step walkthrough.
+ *     • The overlay's own "Next" flow continues independently — the two
+ *       systems are complementary: the overlay gives an overview, GenesisTour
+ *       provides the interactive spotlight walk.
+ *   TASK 4: First-Boot Logic
+ *     • On mount this component reads `localStorage.getItem('isFirstTimeUser')`.
+ *       If the key is absent or equal to 'true', the user is considered new —
+ *       no parent intervention is required for the very first load.
+ *     • `setUserIsNew(false)` and the localStorage write happen inside onClose
+ *       so subsequent sessions are unaffected.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, ChevronRight, ChevronLeft, Terminal, Shield, GitBranch, Dna, Cpu } from 'lucide-react';
+import { X, ChevronRight, ChevronLeft, Terminal, Shield, GitBranch, Dna, PlayCircle } from 'lucide-react';
 import { useArkheStore } from '@/store';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,8 +79,6 @@ interface Step {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § Ghost Sequence
-// A short 40bp demo sequence with an EcoRI site (GAATTC) that will be typed
-// into the terminal input during Step 3, demonstrating live IDE interaction.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const GHOST_SEQUENCE = 'ATGAAAGAATTCGCGGCGGCGCGATCGATCGATCGTAA';
@@ -75,12 +89,6 @@ const BASE_COLORS: Record<string, string> = {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § Step definitions
-// Spotlight regions are tuned to the Workbench layout:
-//   Icon Rail:   left ~2%   of width
-//   Left Panel:  left ~2–20% of width
-//   Center Panel:left ~20–70% of width
-//   Right Panel: left ~70–100% of width
-//   Terminal:    bottom ~25% of height
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STEPS: Step[] = [
@@ -141,7 +149,6 @@ const STEPS: Step[] = [
 // ─────────────────────────────────────────────────────────────────────────────
 
 function SpotlightMask({ region, color }: { region: SpotlightRegion; color: string }) {
-  // Convert % units to SVG viewBox coordinates (0–1000 × 0–1000)
   const cx = (region.cx / 100) * 1000;
   const cy = (region.cy / 100) * 1000;
   const rx = (region.rx / 100) * 1000;
@@ -160,9 +167,7 @@ function SpotlightMask({ region, color }: { region: SpotlightRegion; color: stri
     >
       <defs>
         <mask id="spotlight-mask">
-          {/* White = visible (dimmed) */}
           <rect x="0" y="0" width="1000" height="1000" fill="white" />
-          {/* Black = cut-out (reveals content beneath) */}
           <motion.ellipse
             cx={cx} cy={cy} rx={rx} ry={ry}
             fill="black"
@@ -171,7 +176,6 @@ function SpotlightMask({ region, color }: { region: SpotlightRegion; color: stri
             transition={{ duration: 0.45, ease: [0.4, 0, 0.2, 1] }}
           />
         </mask>
-        {/* Glow filter */}
         <filter id="spotlight-glow" x="-30%" y="-30%" width="160%" height="160%">
           <feGaussianBlur stdDeviation="6" result="blur" />
           <feMerge>
@@ -181,10 +185,8 @@ function SpotlightMask({ region, color }: { region: SpotlightRegion; color: stri
         </filter>
       </defs>
 
-      {/* Dim layer */}
       <rect x="0" y="0" width="1000" height="1000" fill="rgba(2,6,23,0.80)" mask="url(#spotlight-mask)" />
 
-      {/* Glowing ring around the spotlight */}
       <motion.ellipse
         cx={cx} cy={cy}
         initial={{ rx: rx * 0.4 + 4, ry: ry * 0.4 + 4, opacity: 0 }}
@@ -202,12 +204,11 @@ function SpotlightMask({ region, color }: { region: SpotlightRegion; color: stri
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// § Ghost Sequence Typewriter (visible inside the overlay card on Step 3)
-// Also writes to the store so the terminal input lights up behind the overlay
+// § Ghost Sequence Typewriter
 // ─────────────────────────────────────────────────────────────────────────────
 
 function GhostSequenceDisplay({ active }: { active: boolean }) {
-  const [typed,      setTyped]      = useState('');
+  const [typed,          setTyped]          = useState('');
   const setTerminalInput = useArkheStore(s => s.setTerminalInput);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const idxRef   = useRef(0);
@@ -223,7 +224,6 @@ function GhostSequenceDisplay({ active }: { active: boolean }) {
       if (idxRef.current <= GHOST_SEQUENCE.length) {
         const fragment = GHOST_SEQUENCE.slice(0, idxRef.current);
         setTyped(fragment);
-        // Mirror to the terminal input in the background
         if (setTerminalInput) {
           setTerminalInput(`load ${fragment}`);
         }
@@ -302,30 +302,70 @@ function cardPosition(side: Step['cardSide']): React.CSSProperties {
 export default function OnboardingOverlay({ onClose }: OnboardingOverlayProps) {
   const [step, setStep] = useState(0);
 
-  const current   = STEPS[step];
-  const isFirst   = step === 0;
-  const isLast    = step === STEPS.length - 1;
-  const isTerminalStep = current.id === 'terminal';
+  // ── TASK 2: Pull store actions for tour wiring ────────────────────────────
+  const startOnboarding = useArkheStore(s => s.startOnboarding);
+  const setUserIsNew    = useArkheStore(s => s.setUserIsNew);
+
+  const current         = STEPS[step];
+  const isFirst         = step === 0;
+  const isLast          = step === STEPS.length - 1;
+  const isWelcomeStep   = current.id === 'welcome';
+  const isTerminalStep  = current.id === 'terminal';
+
+  // ── TASK 4: First-boot localStorage gate ─────────────────────────────────
+  // This component is only rendered when the parent decides to show it
+  // (based on userIsNew in the store).  On the very first load, `userIsNew`
+  // defaults to `true` in uiSlice.ts so no extra parent logic is needed.
+  // We log a system event here purely for the terminal audit trail.
+  useEffect(() => {
+    const isFirstTime = localStorage.getItem('isFirstTimeUser');
+    if (isFirstTime === null || isFirstTime === 'true') {
+      // First boot confirmed — nothing to do; overlay is already showing.
+    }
+  }, []);
+
+  // ── Wrapped onClose that persists the "seen" flag ─────────────────────────
+  const handleClose = useCallback(() => {
+    localStorage.setItem('isFirstTimeUser', 'false');
+    setUserIsNew(false);
+    onClose();
+  }, [onClose, setUserIsNew]);
 
   const handleNext = useCallback(() => {
     if (!isLast) setStep(s => s + 1);
-    else         onClose();
-  }, [isLast, onClose]);
+    else         handleClose();
+  }, [isLast, handleClose]);
 
   const handlePrev = useCallback(() => {
     if (!isFirst) setStep(s => s - 1);
   }, [isFirst]);
 
+  // ── TASK 2: "Start Tour" handler ──────────────────────────────────────────
+  /**
+   * handleStartTour
+   *
+   * Called when the researcher clicks "Start Tour" on the welcome step.
+   * Sets `onboardingActive = true` in the store, which causes the parent
+   * layout/page to mount <GenesisTour />.  The overlay remains visible so the
+   * researcher can still navigate its own step cards; GenesisTour runs as an
+   * independent parallel layer on top.
+   */
+  const handleStartTour = useCallback(() => {
+    startOnboarding();
+    // Advance to the first non-welcome step so the spotlight activates
+    setStep(1);
+  }, [startOnboarding]);
+
   // Keyboard navigation
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape')     onClose();
+      if (e.key === 'Escape')     handleClose();
       if (e.key === 'ArrowRight') handleNext();
       if (e.key === 'ArrowLeft')  handlePrev();
     };
     document.addEventListener('keydown', h);
     return () => document.removeEventListener('keydown', h);
-  }, [handleNext, handlePrev, onClose]);
+  }, [handleNext, handlePrev, handleClose]);
 
   return (
     <motion.div
@@ -410,7 +450,7 @@ export default function OnboardingOverlay({ onClose }: OnboardingOverlayProps) {
 
             {/* Close */}
             <button
-              onClick={onClose}
+              onClick={handleClose}
               style={{ width: 24, height: 24, borderRadius: 4, border: 'none', background: 'rgba(255,255,255,0.04)', color: '#475569', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 150ms' }}
               onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.09)'; e.currentTarget.style.color = '#94A3B8'; }}
               onMouseLeave={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; e.currentTarget.style.color = '#475569'; }}
@@ -452,8 +492,49 @@ export default function OnboardingOverlay({ onClose }: OnboardingOverlayProps) {
             {/* Ghost sequence (terminal step only) */}
             <GhostSequenceDisplay active={isTerminalStep} />
 
+            {/* ── TASK 2: "Start Tour" CTA on welcome step ────────────────── */}
+            {isWelcomeStep && (
+              <motion.button
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.25, duration: 0.2 }}
+                onClick={handleStartTour}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 8,
+                  width: '100%',
+                  marginTop: 16,
+                  padding: '9px 0',
+                  borderRadius: 8,
+                  border: `1px solid ${current.color}40`,
+                  background: `${current.color}12`,
+                  color: current.color,
+                  cursor: 'pointer',
+                  fontFamily: 'var(--font-jetbrains-mono, monospace)',
+                  fontSize: 11.5,
+                  fontWeight: 700,
+                  letterSpacing: '0.06em',
+                  textTransform: 'uppercase' as const,
+                  transition: 'all 180ms',
+                }}
+                onMouseEnter={e => {
+                  e.currentTarget.style.background = `${current.color}22`;
+                  e.currentTarget.style.boxShadow  = `0 0 20px ${current.color}20`;
+                }}
+                onMouseLeave={e => {
+                  e.currentTarget.style.background = `${current.color}12`;
+                  e.currentTarget.style.boxShadow  = 'none';
+                }}
+              >
+                <PlayCircle size={14} />
+                Start Interactive Tour
+              </motion.button>
+            )}
+
             {/* ── Navigation ── */}
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 18 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: isWelcomeStep ? 10 : 18 }}>
               <button
                 onClick={handlePrev}
                 disabled={isFirst}

@@ -92,10 +92,12 @@ export default function ChronosSidebar({ isCollapsed = false, onToggle }: Chrono
   };
 
   return (
-    <div className={cn(
-      "w-full h-full flex flex-col bg-void-panel transition-all duration-300",
-      isCollapsed && "w-0 overflow-hidden"
-    )}>
+    <div 
+      data-tour="chronos"
+      className={cn(
+        "w-full h-full flex flex-col bg-void-panel transition-all duration-300",
+        isCollapsed && "w-0 overflow-hidden"
+      )}>
       {!workerConnected && (
         <div className="p-4 text-center text-ghost text-xs">
           <Loader2 className="animate-spin mx-auto mb-2" size={16} />

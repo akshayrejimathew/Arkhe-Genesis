@@ -1,4 +1,5 @@
 /**
+ * src/store/types.ts
  *
  * ── SPRINT 2 CHANGES ─────────────────────────────────────────────────────────
  *   TASK 2: UI State Persistence
@@ -7,6 +8,18 @@
  *     • StoreMutators updated to include zustand/persist so StateCreator
  *       declarations in every slice remain correctly typed after index.ts
  *       wraps the store with persist(subscribeWithSelector(...)).
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * ── SOUL INTEGRATION SPRINT ───────────────────────────────────────────────────
+ *   TASK 3 — Sovereign Wiki Modal
+ *     • `isWikiOpen: boolean` added to UIState (default false in uiSlice.ts)
+ *     • `openWiki()` and `closeWiki()` added to UIActions
+ *     These additions fix the four TS2339 / TS2353 errors that appeared after
+ *     uiSlice.ts and GenesisTour.tsx were updated in the previous sprint.
+ *
+ *   TASK 4 — First-Boot Logic
+ *     • `userIsNew` already exists; default changed to `true` in uiSlice.ts.
+ *       No type change required here.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * ── PURPOSE ──────────────────────────────────────────────────────────────────
@@ -59,6 +72,7 @@ import type { PublicGenome } from '@/lib/supabasePublic';
 import type { BioHazard } from '@/lib/sentinelAudit';
 import type { CommandResult } from '@/lib/terminalParser';
 import type { SignatureLibrary, ThreatMatch } from '@/lib/sentinel/ScreeningEngine';
+import type { AccessionMetadata } from '@/lib/RegistryResolver';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § 1 · Primitive store shapes
@@ -401,10 +415,28 @@ export interface UIState {
   terminalLogs: SystemLog[];
 
   // ── SPRINT 3 TASK 4: Interactive Guide Hook ──────────────────────────────────
-  /** True on first visit / signup; drives onboarding entry. */
+  /**
+   * True on first visit — drives the OnboardingOverlay auto-appearance.
+   * Defaults to `true` in uiSlice.ts initialUIState.
+   * Set to `false` via setUserIsNew(false) when the overlay is closed for
+   * the first time; also written to localStorage as 'isFirstTimeUser'='false'.
+   */
   userIsNew: boolean;
-  /** Whether the onboarding overlay is currently active. */
+  /** Whether the onboarding tour overlay is currently active. */
   onboardingActive: boolean;
+
+  // ── SOUL INTEGRATION SPRINT TASK 3: Sovereign Wiki Modal ─────────────────
+  /**
+   * Controls visibility of the Command Codex / Sovereign Research Handbook modal.
+   * Set true via openWiki(), false via closeWiki().
+   * The BioTerminal intercepts the "help" command and calls openWiki() directly.
+   * The Sidebar BookOpen icon also calls openWiki().
+   */
+  isWikiOpen: boolean;
+
+  // ── REGISTRY RESOLVER ──────────────────────────────────────────────────────
+  resolvedAccession: AccessionMetadata | null;
+  isResolvingAccession: boolean;
 }
 
 export interface UIActions {
@@ -435,6 +467,18 @@ export interface UIActions {
   ) => Promise<ThreatMatch[]>;
   clearThreatMatches: () => void;
 
+  // ── SOVEREIGN BRIDGE SPRINT ──────────────────────────────────────────────────
+  /**
+   * Fetch a sequence from NCBI / UniProtKB / Ensembl via the Sovereign Bridge
+   * proxy and stream it into the SlabManager pipeline via genomeSlice.loadFile().
+   *
+   * Guards against concurrent loads via the isProcessing lock and emits
+   * SystemLog entries throughout the fetch/stream lifecycle.
+   *
+   * @param accession  Any supported registry ID (NCBI RefSeq, UniProtKB, Ensembl).
+   */
+  fetchExternalSequence: (accession: string) => Promise<void>;
+
   // Terminal
   setTerminalInput: (input: string) => void;
   executeTerminalCommand: (input: string) => Promise<CommandResult>;
@@ -453,10 +497,25 @@ export interface UIActions {
   setExecuting: (executing: boolean) => void;
   setThreatMatches: (matches: ThreatMatch[]) => void;
 
+  // ── REGISTRY RESOLVER ──────────────────────────────────────────────────────
+  setResolvedAccession: (meta: AccessionMetadata | null) => void;
+
   // ── SPRINT 3 TASK 4: Interactive Guide Hook ──────────────────────────────────
   setUserIsNew: (isNew: boolean) => void;
   startOnboarding: () => void;
   stopOnboarding: () => void;
+
+  // ── SOUL INTEGRATION SPRINT TASK 3: Sovereign Wiki Modal ─────────────────
+  /**
+   * Open the Command Codex modal.
+   * Wire to: Sidebar BookOpen icon, BioTerminal "help" intercept.
+   */
+  openWiki:  () => void;
+  /**
+   * Close the Command Codex modal.
+   * Wire to: modal X button, Escape key handler inside WikiModal.
+   */
+  closeWiki: () => void;
 }
 
 /** Full UI slice type consumed by StateCreator. */

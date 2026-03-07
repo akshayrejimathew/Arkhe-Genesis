@@ -56,6 +56,7 @@ import {
   AlertTriangle, CheckCircle2, Microscope,
   Radar, FileCheck, ShieldCheck, ShieldAlert,
   Sun, Moon, Stethoscope, Share2, FlaskConical,
+  BookOpen,
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -95,6 +96,7 @@ import ProteinViewport from '@/components/visuals/ProteinViewport';
 import OffTargetHeatmap from '@/components/visualization/OffTargetHeatmap';
 import GenesisAuditReport from '@/components/reports/GenesisAuditReport';
 import { generateAuditReport } from '@/lib/reportGenerator';
+import GenesisTour from '@/components/onboarding/GenesisTour';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // § Panel type aliases
@@ -1100,6 +1102,7 @@ export default function Workbench() {
   // ── Theme ───────────────────────────────────────────────────────────────────
   const themeMode    = useArkheStore((s: ArkheState) => s.themeMode);
   const setThemeMode = useArkheStore((s: ArkheState) => s.setThemeMode);
+  const onboardingActive = useArkheStore(s => s.onboardingActive);
   const T = THEMES[themeMode];
   const toggleTheme = useCallback(
     () => setThemeMode(themeMode === 'abyssal' ? 'cleanroom' : 'abyssal'),
@@ -1147,6 +1150,7 @@ export default function Workbench() {
   const exportMutantFasta   = useArkheStore((s: ArkheState) => s.exportMutantFasta);
   const getDiffForTx        = useArkheStore((s: ArkheState) => s.getDiffForTx);
   const addSystemLog        = useArkheStore((s: ArkheState) => s.addSystemLog);
+  const openWiki            = useArkheStore((s: ArkheState) => s.openWiki);
 
   const { viewport, requestViewport, terminalLogs } = useArkheStore();
   const sentinelResults = (useArkheStore.getState() as any).sentinelScanResults || [];
@@ -1364,6 +1368,7 @@ export default function Workbench() {
             <button
               onClick={triggerUpload}
               disabled={isSyncing}
+              data-tour="file-upload"
               title="Ingest genome file (.fasta / .gb / .vcf)"
               style={{
                 display: 'flex', alignItems: 'center', gap: 5, padding: '5px 11px', borderRadius: 5,
@@ -1563,6 +1568,15 @@ export default function Workbench() {
             })}
 
             <div style={{ flex: 1 }} />
+
+            {/* WIKI / CODEX */}
+            <button onClick={openWiki} title="Command Codex (Help)"
+              style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 32, height: 32, margin: '0 auto', borderRadius: 4, border: 'none', cursor: 'pointer', background: 'transparent', color: T.textGhost, transition: 'all 120ms' }}
+              onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = T.bgHover; (e.currentTarget as HTMLElement).style.color = T.iconHover; }}
+              onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent'; (e.currentTarget as HTMLElement).style.color = T.textGhost; }}
+            >
+              <BookOpen size={14} />
+            </button>
 
             <button onClick={toggleTerminal} title="Toggle Terminal (⌘T)"
               style={{
@@ -1801,6 +1815,9 @@ export default function Workbench() {
           </Group>
         </div>
       </div>
+      <AnimatePresence>
+        {onboardingActive && <GenesisTour />}
+      </AnimatePresence>
     </ThemeContext.Provider>
   );
 }

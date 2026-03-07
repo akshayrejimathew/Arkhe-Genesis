@@ -859,6 +859,7 @@ export default function SequenceView({ onRequestUpload }: SequenceViewProps) {
   return (
     <div
       ref={containerRef}
+      data-tour="sequence-editor"
       className="w-full h-full relative overflow-hidden"
       style={{ background: '#020617', cursor: isDragging ? 'text' : 'default' }}
       onClick={handleContainerClick}

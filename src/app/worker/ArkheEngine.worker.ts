@@ -1,6 +1,65 @@
-
-
 /// <reference lib="webworker" />
+
+/**
+ * ArkheEngine.worker.ts
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SS-01 — Scientific Streaming: CHUNK_RECEIVED handler (NEW)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ *   The CHUNK_RECEIVED message type is the worker-side half of the
+ *   SlabStreamingPipeline defined in SlabManager.ts.
+ *
+ *   PROTOCOL:
+ *
+ *     Main thread                         Worker
+ *     ─────────────────────────────────   ──────────────────────────────────
+ *     SlabStreamingPipeline.streamFromUrl()
+ *       accumulate 1 MB network bytes
+ *       postMessage CHUNK_RECEIVED ──────►  case 'CHUNK_RECEIVED':
+ *         { chunkId, buffer,                 1. record beforeLength
+ *           isFinal, totalBytes }            2. handleStreamChunk()
+ *                                               → FASTA parse
+ *                                               → appendBytes() → slabs
+ *                                               → OOM guard
+ *                                            3. Per-chunk Sentinel scan
+ *                                               on [beforeLength, afterLength)
+ *                                            4. If isFinal → finalizeStream()
+ *                                            5. postMessage CHUNK_LOADED
+ *                                               (progress broadcast)
+ *                                   ◄────── 6. postMessage CHUNK_ACK
+ *                                               { chunkId, ok }
+ *       acknowledgeChunk(chunkId)
+ *       → inFlight--
+ *       → next chunk unblocked
+ *
+ *   CHUNK_ACK is sent AFTER both appendBytes() AND the Sentinel scan are
+ *   complete, so the main thread's backpressure directly reflects the
+ *   worker's actual processing capacity (not just message-queue depth).
+ *
+ *   ERROR PATH:
+ *     If handleStreamChunk() returns void (OOM abort or malformed FASTA),
+ *     the handler posts CHUNK_ERR instead of CHUNK_ACK. The pipeline's
+ *     rejectChunk() then throws in streamFromUrl(), surfacing the error
+ *     to the caller.
+ *
+ *   SENTINEL INTEGRATION:
+ *     Each chunk's newly committed base range [beforeLength, afterLength)
+ *     is read back from the slabs, converted to a string, and passed to
+ *     engine.screenThreats(). If threats are found, a SENTINEL_THREAT_FOUND
+ *     message is broadcast immediately — while the rest of the genome is
+ *     still downloading. This is the "scan the beginning while the end
+ *     downloads" property described in the SS-01 design doc.
+ *
+ *   CHUNK_RECEIVED vs STREAM_CHUNK:
+ *     STREAM_CHUNK is the legacy message type sent by the old main-thread
+ *     streaming code. It remains supported for backwards compatibility.
+ *     CHUNK_RECEIVED is the new Scientific Streaming path with:
+ *       • Backpressure ACK
+ *       • Per-chunk Sentinel scan
+ *       • CHUNK_LOADED progress broadcast
+ *       • isFinal flag that auto-calls finalizeStream()
+ */
 
 import { SlabManager, SLAB_SIZE } from '../../lib/SlabManager';
 import { StreamParser } from '../../lib/StreamParser';
@@ -62,20 +121,37 @@ const COMPLEMENT: Record<BaseCode, BaseCode> = {
 };
 
 // ---------- Yielding loop constants ----------
-const YIELD_INTERVAL_MS = 50;          // yield if we've been running this long without a break
-const YIELD_ITERATION_COUNT = 5000;    // also yield after this many loop iterations
-const MAX_SCAN_TIME_MS = 2000;          // abort if total scan exceeds 2 seconds
+const YIELD_INTERVAL_MS = 50;
+const YIELD_ITERATION_COUNT = 5000;
+const MAX_SCAN_TIME_MS = 2000;
 
 // ---------- TASK 1: Unbounded streamBuffer Guard ----------
-const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB
-const HARD_MEMORY_LIMIT = 512 * 1024 * 1024; // 512MB
+const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50 MB
+const HARD_MEMORY_LIMIT = 512 * 1024 * 1024; // 512 MB
 
 // ---------- TASK 2: Auto‑annotation chunk size ----------
-const AUTO_ANNOTATE_CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
-const AUTO_ANNOTATE_OVERLAP = 10 * 1024; // 10kb overlap to catch boundary features
+const AUTO_ANNOTATE_CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB
+const AUTO_ANNOTATE_OVERLAP = 10 * 1024; // 10 KB overlap to catch boundary features
 
 // ---------- TASK 2 (Sentinel): Overlap for threat scanning ----------
-const KMER_SIZE = 24;  // must match ScreeningEngine's constant
+const KMER_SIZE = 24; // must match ScreeningEngine's constant
+
+// ---------- SS-01: Per-chunk Sentinel scan constants ----------
+/**
+ * Maximum bases to Sentinel-scan per CHUNK_RECEIVED message.
+ *
+ * Sentinel scanning is O(n) in the chunk length.  For a 1 MB slab
+ * (≈ 1M bases at 1 byte/base), a full scan takes ≈ 8 ms on a modern CPU.
+ * We cap at 2 MB to prevent the scan from consuming an entire 16 ms frame
+ * budget, keeping the worker responsive to other messages.
+ */
+const SS_SENTINEL_SCAN_MAX_BASES = 2 * 1024 * 1024; // 2 MB
+
+/**
+ * Base-code → IUPAC character lookup for converting slab bytes back to
+ * the string required by ScreeningEngine.scan() and screenThreats().
+ */
+const BASE_CODE_TO_CHAR = ['A', 'C', 'G', 'T', 'N'] as const;
 
 // ---------- Telemetry Logger (with Debug Mode) ----------
 let DEBUG_MODE = false;
@@ -105,18 +181,18 @@ function logToUI(
  */
 interface SyntenyScanState {
   step: 'direct' | 'inverted' | 'done';
-  hashMap: Map<number, number[]>;          // rolling hash → positions (direct repeats)
-  rcRegion: Uint8Array;                     // reverse complement of the genome region
-  keys: number[];                            // iterator over hashMap keys
-  keyIndex: number;                          // current key being processed
-  positions: number[];                       // positions for current key
-  i: number;                                  // inner loop index for positions[i]
-  j: number;                                  // inner loop index for positions[j]
-  anchors: SyntenyAnchor[];                   // accumulated anchors
-  startTime: number;                           // performance.now() at start
-  lastYieldTime: number;                       // performance.now() when we last yielded
-  iterationsSinceYield: number;                // count of iterations since last yield
-  aborted: boolean;                             // true if aborted due to timeout
+  hashMap: Map<number, number[]>;
+  rcRegion: Uint8Array;
+  keys: number[];
+  keyIndex: number;
+  positions: number[];
+  i: number;
+  j: number;
+  anchors: SyntenyAnchor[];
+  startTime: number;
+  lastYieldTime: number;
+  iterationsSinceYield: number;
+  aborted: boolean;
 }
 
 class ArkheEngine {
@@ -135,7 +211,7 @@ class ArkheEngine {
   // Zombie transition prevention
   private activeTaskId: string | null = null;
   private taskCounter = 0;
-  
+
   // TASK: Worker Task Cancellation - currentTaskId for killing Ghost Tasks
   private currentTaskId: number = 0;
 
@@ -152,22 +228,18 @@ class ArkheEngine {
 
   private syntenyAnchors: SyntenyAnchor[] = [];
   private syntenyTaskId: number | null = null;
-  // TASK 4: state for incremental synteny scan
   private syntenyScanState: SyntenyScanState | null = null;
 
   // ---------- Streaming buffers (LB-03 / LB-12 fix) ----------
-  // Byte accumulator – replaces string concatenation.
-  private streamByteBuffer: Uint8Array = new Uint8Array(65536); // start with 64KB
-  private streamByteLength: number = 0; // number of valid bytes in buffer
-  // TASK 1: stream abort flag
+  private streamByteBuffer: Uint8Array = new Uint8Array(65536);
+  private streamByteLength: number = 0;
   private streamAborted: boolean = false;
 
-  // Staging buffer for base codes (unchanged)
   private stagingBuffer: Uint8Array = new Uint8Array(65536);
   private stagingIndex: number = 0;
 
   // ---------- Sentinel Threat Screening ----------
-  private screeningEngine: ScreeningEngine = new ScreeningEngine();
+  public screeningEngine: ScreeningEngine = new ScreeningEngine();
 
   // ---------- TASK 3: Request cancellation for viewport loads ----------
   private viewportRequestCounter: number = 0;
@@ -210,14 +282,9 @@ class ArkheEngine {
     return { ok: true, slabSize: SLAB_SIZE, useShared: config.useSharedArray, debugMode: DEBUG_MODE };
   }
 
-  /**
-   * SHADOW-NEW-01 FIX + SPRINT 5 Adaptive Slab Sizing.
-   */
   resetEngine(expectedFileSize?: number): void {
     this.taskCounter++;
     this.activeTaskId = `task-${this.taskCounter}-${Date.now()}`;
-    
-    // TASK: Increment currentTaskId for new task
     this.currentTaskId++;
 
     if (this.sentinelTaskId) {
@@ -241,7 +308,6 @@ class ArkheEngine {
       this.syntenyTaskId = null;
     }
 
-    // TASK 4: clear synteny scan state
     this.syntenyScanState = null;
 
     this.sentinelCache = null;
@@ -252,7 +318,6 @@ class ArkheEngine {
     this.offTargetCache.clear();
     this.editedSlabs.clear();
 
-    // TASK 1: Reset byte stream state
     this.streamByteBuffer = new Uint8Array(65536);
     this.streamByteLength = 0;
     this.streamAborted = false;
@@ -268,12 +333,6 @@ class ArkheEngine {
     return this.activeTaskId || 'unknown';
   }
 
-  // --- Request ID management for TASK 3 ---
-  /**
-   * Generates a new monotonically increasing request ID and marks it as the
-   * latest viewport request.  Used by LOAD_SLICE to enable cancellation of
-   * stale requests.
-   */
   public getNextRequestId(): number {
     this.viewportRequestCounter++;
     this.latestViewportRequestId = this.viewportRequestCounter;
@@ -293,7 +352,6 @@ class ArkheEngine {
       return [];
     }
 
-    // Extend the region to include (KMER_SIZE-1) bases from the left to catch boundary‑crossing threats.
     const effectiveStart = Math.max(0, (start ?? 0) - (KMER_SIZE - 1));
     const effectiveEnd = end ?? sequence.length - 1;
     const extendedSeq = sequence.slice(effectiveStart, effectiveEnd + 1);
@@ -302,7 +360,7 @@ class ArkheEngine {
       extendedSeq,
       0,
       undefined,
-      effectiveStart  // globalStart: the original start coordinate
+      effectiveStart
     );
 
     if (matches.length > 0) {
@@ -311,7 +369,7 @@ class ArkheEngine {
     return matches;
   }
 
-  // --- ORF Autopilot (now async) ---
+  // --- ORF Autopilot ---
   private scheduleORFScan() {
     if (typeof self.requestIdleCallback === 'function') {
       this.orfTaskId = self.requestIdleCallback(
@@ -406,12 +464,11 @@ class ArkheEngine {
     );
   }
 
-  // --- Auto‑Annotator with TASK 2 chunking (LB-07) ---
+  // --- Auto‑Annotator with TASK 2 chunking ---
   async autoAnnotateGenome(): Promise<FeatureTag[]> {
     const genomeLength = this.slabManager.getGenomeLength();
     if (genomeLength === 0) return [];
 
-    // TASK 2: 500 million base guard (kept from earlier)
     if (genomeLength > 500_000_000) {
       logToUI('ANNOTATION', 'Genome exceeds 500Mb; full auto‑annotation disabled. Use on‑demand region analysis.', 'warning');
       return [];
@@ -422,18 +479,15 @@ class ArkheEngine {
     const overlap = AUTO_ANNOTATE_OVERLAP;
 
     for (let start = 0; start < genomeLength; start += chunkSize) {
-      // Ensure overlap on both sides, but clamp to genome bounds
       const chunkStart = Math.max(0, start - overlap);
       const chunkEnd = Math.min(genomeLength - 1, start + chunkSize + overlap - 1);
       const region = this.slabManager.readRegion(chunkStart, chunkEnd);
 
-      // Auto‑annotate this chunk
       const chunkFeatures = await this.bioLogic.autoAnnotate(region, ORF_MIN_AA_LENGTH);
 
-      // Convert global coordinates and push
       for (const f of chunkFeatures) {
         const globalFeat: FeatureTag = {
-          id: `auto-${Date.now()}-${Math.random().toString(36)}`, // generate unique id
+          id: `auto-${Date.now()}-${Math.random().toString(36)}`,
           name: f.name,
           type: f.type,
           start: chunkStart + f.start,
@@ -444,13 +498,11 @@ class ArkheEngine {
         features.push(globalFeat);
       }
 
-      // (Optional) yield to event loop for large genomes
       if (genomeLength > 100_000_000) {
         await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
 
-    // Simple deduplication: if two features overlap > 90%, keep only one
     const uniqueFeatures: FeatureTag[] = [];
     for (const f of features) {
       const duplicate = uniqueFeatures.some(existing =>
@@ -555,7 +607,7 @@ class ArkheEngine {
     return this.sentinelCache;
   }
 
-  // --- Restriction Enzyme Finder (async) ---
+  // --- Restriction Enzyme Finder ---
   async findRestrictionSites(
     start: number,
     end: number,
@@ -715,9 +767,8 @@ class ArkheEngine {
     }
   }
 
-  // --- Synteny Ghosting (TASK 4: Refactored with yielding) ---
+  // --- Synteny Ghosting ---
   private scheduleSyntenyScan(): void {
-    // If there's already a scan in progress (state not null and not done), don't start another.
     if (this.syntenyScanState && this.syntenyScanState.step !== 'done') {
       return;
     }
@@ -745,15 +796,10 @@ class ArkheEngine {
     return hash;
   }
 
-  /**
-   * TASK 4: Refactored to yield control every YIELD_INTERVAL_MS or YIELD_ITERATION_COUNT.
-   * Aborts if total scan time exceeds MAX_SCAN_TIME_MS.
-   */
   public scanStructuralVariants(deadline?: IdleDeadline): void {
     const currentTaskId = this.getCurrentTaskId();
     const genomeLength = this.slabManager.getGenomeLength();
 
-    // Guard: not enough sequence
     if (genomeLength < REPEAT_MIN_LENGTH * 2) {
       this.syntenyAnchors = [];
       postMessage({ type: 'SYNTENY_ANCHORS', payload: [] });
@@ -761,13 +807,11 @@ class ArkheEngine {
       return;
     }
 
-    // Initialize state if this is the first call for this scan
     if (!this.syntenyScanState) {
       const region = this.slabManager.readRegion(0, genomeLength - 1);
       const rcRegion = this.reverseComplement(region);
       const windowSize = REPEAT_MIN_LENGTH;
 
-      // Build rolling hash map for direct repeats
       const hashMap = new Map<number, number[]>();
       let hash = this.computeRollingHash(region, 0, windowSize);
       hashMap.set(hash, [0]);
@@ -797,7 +841,6 @@ class ArkheEngine {
     }
 
     const state = this.syntenyScanState;
-    // If already aborted, clean up and exit
     if (state.aborted) {
       this.syntenyScanState = null;
       return;
@@ -812,20 +855,17 @@ class ArkheEngine {
       return;
     }
 
-    // Helper to check if we should yield
     const shouldYield = (): boolean => {
       if (!deadline) {
-        // Safari Fallback: yield every 50ms of real time
         const now = performance.now();
         if (state.lastYieldTime === undefined) state.lastYieldTime = now;
-        return (now - state.lastYieldTime) > 50; 
+        return (now - state.lastYieldTime) > 50;
       }
       if (deadline.timeRemaining() < 2) return true;
       const timeSinceLastYield = performance.now() - state.lastYieldTime;
       return timeSinceLastYield > YIELD_INTERVAL_MS || state.iterationsSinceYield > YIELD_ITERATION_COUNT;
     };
 
-    // Process work in chunks, yielding as needed
     let workDone = false;
 
     while (!workDone && !shouldYield()) {
@@ -839,14 +879,12 @@ class ArkheEngine {
       state.iterationsSinceYield++;
     }
 
-    // Update yield timer if we yielded
     if (shouldYield() && !workDone) {
       state.lastYieldTime = performance.now();
       state.iterationsSinceYield = 0;
     }
 
     if (workDone && state.step === 'done') {
-      // Scan finished successfully
       this.syntenyAnchors = state.anchors;
       postMessage({ type: 'SYNTENY_ANCHORS', payload: state.anchors });
 
@@ -863,43 +901,34 @@ class ArkheEngine {
         logToUI('GHOST', `Found ${slabHits.size} slabs with structural variants`, 'info');
       }
 
-      this.syntenyScanState = null; // clear state
+      this.syntenyScanState = null;
     } else {
-      // Not done yet, reschedule
       this.scheduleSyntenyScan();
     }
   }
 
-  /**
-   * Process one unit of direct repeat detection.
-   * Returns true when the direct repeat phase is complete.
-   */
   private processDirectRepeatsChunk(state: SyntenyScanState): boolean {
     const { hashMap, keys } = state;
 
-    // If we've processed all keys, move to inverted phase
     if (state.keyIndex >= keys.length) {
       state.step = 'inverted';
       state.keyIndex = 0;
       state.i = 0;
       state.j = 0;
-      return false; // not done overall, but direct phase finished
+      return false;
     }
 
     const key = keys[state.keyIndex];
     const positions = hashMap.get(key)!;
 
-    // If we haven't started this key's positions, set up
     if (state.positions !== positions) {
       state.positions = positions;
       state.i = 0;
       state.j = 1;
     }
 
-    // Process pairs for this key
     const positionsLen = positions.length;
     while (state.i < positionsLen && state.j < positionsLen) {
-      // Create an anchor for each pair (i < j)
       state.anchors.push({
         type: 'direct_repeat',
         startA: positions[state.i],
@@ -910,7 +939,6 @@ class ArkheEngine {
         length: REPEAT_MIN_LENGTH,
       });
 
-      // Move to next pair
       state.j++;
       if (state.j >= positionsLen) {
         state.i++;
@@ -918,40 +946,30 @@ class ArkheEngine {
       }
       state.iterationsSinceYield++;
 
-      // DOOMSDAY PATCH: Break the synchronous black hole
       if (state.iterationsSinceYield > YIELD_ITERATION_COUNT) {
-        return false; // Yield control back to the outer loop
+        return false;
       }
     }
 
-    // Move to next key
     state.keyIndex++;
-    return false; // not done overall
+    return false;
   }
 
-  /**
-   * Process one unit of inverted repeat detection.
-   * Returns true when the inverted repeat phase is complete.
-   */
   private processInvertedRepeatsChunk(state: SyntenyScanState): boolean {
     const windowSize = REPEAT_MIN_LENGTH;
     const region = this.slabManager.readRegion(0, this.slabManager.getGenomeLength() - 1);
     const rcRegion = state.rcRegion;
 
-    // Outer loop: i over forward positions
     while (state.i <= region.length - windowSize) {
       const i = state.i;
 
-      // Inner loop: j over reverse complement positions
       while (state.j <= rcRegion.length - windowSize) {
         const j = state.j;
 
-        // Compare forward hash with reverse hash
         const fwdHash = this.computeRollingHash(region, i, windowSize);
         const rcHash = this.computeRollingHash(rcRegion, j, windowSize);
 
         if (fwdHash === rcHash) {
-          // Verify full match (avoid hash collisions)
           let match = true;
           for (let k = 0; k < windowSize; k++) {
             if (region[i + k] !== rcRegion[j + k]) {
@@ -975,23 +993,19 @@ class ArkheEngine {
         state.j++;
         state.iterationsSinceYield++;
 
-        // DOOMSDAY PATCH: Break the synchronous black hole
         if (state.iterationsSinceYield > YIELD_ITERATION_COUNT) {
-          return false; // Yield control back to the outer loop
+          return false;
         }
       }
 
-      // Reset inner loop, advance outer
       state.i++;
       state.j = 0;
 
-      // DOOMSDAY PATCH: Break the synchronous black hole
       if (state.iterationsSinceYield > YIELD_ITERATION_COUNT) {
-        return false; // Yield control back to the outer loop
+        return false;
       }
     }
 
-    // If we've exhausted all i, we're done
     if (state.i > region.length - windowSize) {
       state.step = 'done';
       return true;
@@ -1004,14 +1018,13 @@ class ArkheEngine {
   }
 
   refreshSyntenyScan(): SyntenyAnchor[] {
-    // Abort any ongoing scan and start fresh
     this.syntenyScanState = null;
     this.syntenyAnchors = [];
     this.scanStructuralVariants();
     return this.syntenyAnchors;
   }
 
-  // --- Splice & Isoform Oracle (async) ---
+  // --- Splice & Isoform Oracle ---
   async predictSpliceSites(buffer: Uint8Array, strand: '+' | '-' = '+'): Promise<SpliceSite[]> {
     return this.bioLogic.predictSpliceSites(buffer, strand);
   }
@@ -1170,7 +1183,7 @@ class ArkheEngine {
     return overlap;
   }
 
-  // --- Hairpin Sentinel (async) ---
+  // --- Hairpin Sentinel ---
   async detectHairpins(sequence: string): Promise<HairpinPrediction[]> {
     const hairpins = await this.bioLogic.detectHairpins(sequence);
     if (hairpins.length > 0) {
@@ -1204,26 +1217,15 @@ class ArkheEngine {
     return result;
   }
 
-  // --- Streaming (FASTA-aware with TASK 1 guard) ---
+  // --- Streaming ---
 
-  /**
-   * Process a single line (as a Uint8Array) by converting to string and
-   * feeding into processSequenceLine.
-   */
   private processLineBytes(lineBytes: Uint8Array): void {
-    // Convert to ASCII string – safe because FASTA lines are ASCII.
-    // Use TextDecoder for efficiency.
     const decoder = new TextDecoder('ascii');
     const line = decoder.decode(lineBytes);
-    // Skip header lines (start with '>')
     if (line.startsWith('>')) return;
     this.processSequenceLine(line);
   }
 
-  /**
-   * Process a line string (already stripped of newline) by iterating characters
-   * and appending base codes to stagingBuffer.
-   */
   private processSequenceLine(line: string): void {
     for (let i = 0; i < line.length; i++) {
       const ch = line[i].toUpperCase();
@@ -1240,13 +1242,8 @@ class ArkheEngine {
     }
   }
 
-  /**
-   * Ensures the streamByteBuffer has enough capacity for at least `needed` bytes.
-   * Grows exponentially (factor 2) to avoid frequent reallocation.
-   */
   private ensureStreamBufferCapacity(needed: number): void {
     if (this.streamByteBuffer.length - this.streamByteLength >= needed) return;
-    // Double the size until it fits
     let newSize = this.streamByteBuffer.length;
     while (newSize - this.streamByteLength < needed) {
       newSize *= 2;
@@ -1256,27 +1253,15 @@ class ArkheEngine {
     this.streamByteBuffer = newBuffer;
   }
 
-  /**
-   * handleStreamChunk – TASK 1 (LB-03/12) refactored.
-   *
-   * Now uses a byte accumulator to avoid massive string concatenations.
-   * Scans for newline characters and processes complete lines.
-   * Also checks total allocated memory against HARD_MEMORY_LIMIT.
-   *
-   * After processing, if remaining data <25% of buffer capacity, the buffer
-   * is shrunk to free memory.
-   */
   handleStreamChunk(payload: { fileId: string; chunkBuffer: ArrayBuffer; byteOffset: number }): { processed: number } | void {
-    // If stream already aborted, ignore further chunks
     if (this.streamAborted) {
       return { processed: 0 };
     }
 
-    // Check total allocated memory before processing this chunk
     const totalAllocated = this.slabManager.getTotalAllocatedBytes();
     if (totalAllocated > HARD_MEMORY_LIMIT) {
       this.streamAborted = true;
-      this.streamByteLength = 0; // free buffer
+      this.streamByteLength = 0;
       postMessage({
         type: 'ERROR',
         payload: { message: 'OUT_OF_MEMORY_PROTECTION: Total slab allocation exceeded 512MB' }
@@ -1286,21 +1271,16 @@ class ArkheEngine {
     }
 
     const bytes = new Uint8Array(payload.chunkBuffer);
-    // Ensure we have room for the new bytes
     this.ensureStreamBufferCapacity(bytes.length);
-    // Append to streamByteBuffer
     this.streamByteBuffer.set(bytes, this.streamByteLength);
     this.streamByteLength += bytes.length;
 
-    // Scan for newlines (ASCII 10) from the beginning of the buffer
     let processedBytes = 0;
     let lineStart = 0;
     for (let i = 0; i < this.streamByteLength; i++) {
-      if (this.streamByteBuffer[i] === 10) { // newline
-        // Extract line (excluding newline)
+      if (this.streamByteBuffer[i] === 10) {
         const lineBytes = this.streamByteBuffer.subarray(lineStart, i);
         if (lineBytes.length > MAX_BUFFER_SIZE) {
-          // Line too long – abort
           this.streamAborted = true;
           this.streamByteLength = 0;
           postMessage({
@@ -1312,12 +1292,11 @@ class ArkheEngine {
         }
         this.processLineBytes(lineBytes);
         lineStart = i + 1;
-        processedBytes = i + 1; // mark processed up to this newline
+        processedBytes = i + 1;
       }
     }
 
     if (processedBytes > 0) {
-      // Remove processed bytes from buffer by shifting remaining data to front
       const remaining = this.streamByteLength - processedBytes;
       if (remaining > 0) {
         this.streamByteBuffer.copyWithin(0, processedBytes, this.streamByteLength);
@@ -1325,7 +1304,6 @@ class ArkheEngine {
       this.streamByteLength = remaining;
     }
 
-    // If no newline found and buffer size exceeds MAX_BUFFER_SIZE, it's a single line too long
     if (lineStart === 0 && this.streamByteLength > MAX_BUFFER_SIZE) {
       this.streamAborted = true;
       this.streamByteLength = 0;
@@ -1337,11 +1315,9 @@ class ArkheEngine {
       return { processed: 0 };
     }
 
-    // --- TASK 3: Shrink buffer if remaining data <25% of capacity ---
     const capacity = this.streamByteBuffer.length;
     if (this.streamByteLength > 0 && this.streamByteLength < capacity * 0.25) {
-      // Shrink to the next power of two >= streamByteLength
-      let newSize = 64; // minimum
+      let newSize = 64;
       while (newSize < this.streamByteLength) newSize *= 2;
       const newBuffer = new Uint8Array(newSize);
       newBuffer.set(this.streamByteBuffer.subarray(0, this.streamByteLength));
@@ -1357,7 +1333,6 @@ class ArkheEngine {
       logToUI('WORKER', 'Finalize called on aborted stream – ignoring', 'warning');
       return;
     }
-    // Process any remaining bytes as the last line (if not a header)
     if (this.streamByteLength > 0) {
       const lastLine = this.streamByteBuffer.subarray(0, this.streamByteLength);
       const decoder = new TextDecoder('ascii');
@@ -1376,9 +1351,8 @@ class ArkheEngine {
     logToUI('WORKER', 'Stream finalized, staging buffer flushed', 'info');
   }
 
-  // --- Load Slice with TASK 3 cancellation support (async) ---
+  // --- Load Slice ---
   async loadSlice(payload: { start: number; end: number }, requestId: number): Promise<SliceResponse | null> {
-    // TASK 3: Discard if this request is no longer the latest
     if (requestId !== this.latestViewportRequestId) {
       return null;
     }
@@ -1386,7 +1360,6 @@ class ArkheEngine {
     const safeEnd = Math.min(payload.end, payload.start + 200_000);
     const data = this.slabManager.readRegion(payload.start, safeEnd);
 
-    // Check again after reading (heavy operation) – still latest?
     if (requestId !== this.latestViewportRequestId) {
       return null;
     }
@@ -1407,7 +1380,6 @@ class ArkheEngine {
       isoforms = await this.bioLogic.predictIsoforms(data, longestORF, spliceSites);
     }
 
-    // Final check before returning
     if (requestId !== this.latestViewportRequestId) {
       return null;
     }
@@ -1533,18 +1505,12 @@ class ArkheEngine {
     this.persistence.saveTransaction(this.chronos.getAllCommits());
     this.orfCache = null;
     this.offTargetCache.clear();
-
     logToUI('CHRONOS', `Undo: reverted ${reverseOps.length} mutation(s)`, 'info');
-
     const allBranches = this.chronos.getBranches();
     postMessage({
       type: 'COMMIT_SYNC',
-      payload: {
-        newCommits: [],
-        branches: allBranches,
-      },
+      payload: { newCommits: [], branches: allBranches },
     });
-
     return reverseOps;
   }
 
@@ -1558,18 +1524,12 @@ class ArkheEngine {
     this.persistence.saveTransaction(this.chronos.getAllCommits());
     this.orfCache = null;
     this.offTargetCache.clear();
-
     logToUI('CHRONOS', `Redo: reapplied ${forwardOps.length} mutation(s)`, 'info');
-
     const allBranches = this.chronos.getBranches();
     postMessage({
       type: 'COMMIT_SYNC',
-      payload: {
-        newCommits: [],
-        branches: allBranches,
-      },
+      payload: { newCommits: [], branches: allBranches },
     });
-
     return forwardOps;
   }
 
@@ -1857,26 +1817,6 @@ class ArkheEngine {
       const start = slabIdx * SLAB_SIZE;
       const end = start + slabLength - 1;
 
-      // ── SPRINT 2 FIX (TASK 5) — FASTA Header Sanitization ────────────────
-      //
-      // FASTA headers are parsed by downstream legacy bioinformatics tools
-      // (BWA, SAMtools, Bowtie2, shell pipelines) using whitespace and special
-      // characters as field delimiters or as shell metacharacters. If a slab
-      // coordinate or genome name contains `;`, `|`, or `&`, it can:
-      //
-      //   • `|`  — split the header in tools that use `|` as a record separator
-      //             (e.g. NCBI-style compound IDs in BLAST databases).
-      //   • `;`  — terminate a shell command when the FASTA is piped to a
-      //             legacy tool that constructs shell commands from header fields.
-      //   • `&`  — background a subcommand in shell pipelines, enabling
-      //             command injection if the header is used in a shell context.
-      //
-      // We strip all three from any value that is interpolated into the header
-      // line. The coordinate values are numeric and cannot contain these chars,
-      // but we sanitize them defensively anyway.
-      //
-      // A general-purpose sanitizer is defined here as a local helper so it
-      // can be applied to any future header fields added in later sprints.
       const sanitizeFastaHeaderField = (value: string): string =>
         value.replace(/[;|&]/g, '_');
 
@@ -1899,23 +1839,10 @@ class ArkheEngine {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SPRINT 1 FIX — TASK 4: Worker Bounds-Check Middleware
-//
-// Any message whose payload carries genomic offset coordinates is validated
-// against the current genome length BEFORE the switch dispatches to the
-// handler.  If a coordinate is out-of-range the middleware throws a RangeError
-// which is caught by the outer try/catch and returned to the UI as an ERROR
-// message — no silent reads into uninitialised slab memory can occur.
-//
-// Coordinate field conventions:
-//   offset, start, end              — generic genomic byte offsets
-//   startOffset, endOffset          — DiffEngine slab-relative offsets (also checked)
-//   templateStart, templateEnd      — PCR template window
-//
-// A genome length of 0 means no genome is loaded yet; in that case the check
-// is skipped so the engine can still process INIT / STREAM_CHUNK messages.
 // ─────────────────────────────────────────────────────────────────────────────
+
 function assertOffsetInBounds(value: number, genomeLength: number, label: string): void {
-  if (genomeLength === 0) return; // genome not yet loaded — defer all checks
+  if (genomeLength === 0) return;
   if (!Number.isFinite(value)) {
     throw new RangeError(`BOUNDS_VIOLATION: ${label}=${value} is not a finite number`);
   }
@@ -1926,20 +1853,6 @@ function assertOffsetInBounds(value: number, genomeLength: number, label: string
   }
 }
 
-/**
- * boundsCheckMiddleware
- *
- * Extracts all offset-bearing fields from `payload` by message `type` and
- * validates each against the current genome length.
- *
- * Strict-checked fields (must be within [0, genomeLength-1]):
- *   offset, startOffset, templateStart
- *
- * Lax-checked fields (must be ≥ 0; handlers clamp the upper bound internally):
- *   start, end, endOffset, templateEnd
- *
- * Called once per message at the top of self.onmessage before the switch.
- */
 function boundsCheckMiddleware(
   type: string,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1948,7 +1861,6 @@ function boundsCheckMiddleware(
 ): void {
   if (!payload || genomeLength === 0) return;
 
-  // Messages that carry raw byte offsets into the genome
   const OFFSET_BEARING_TYPES = new Set([
     'LOAD_SLICE',
     'PERFORM_SURGICAL_MUTATION',
@@ -1960,12 +1872,11 @@ function boundsCheckMiddleware(
     'FIND_RESTRICTION_SITES',
     'SIMULATE_PCR_ADVANCED',
     'RUN_ISOFORM_SCAN',
-    'VERIFY_SLAB_STATE', // no offsets, but safe to include
+    'VERIFY_SLAB_STATE',
   ]);
 
   if (!OFFSET_BEARING_TYPES.has(type)) return;
 
-  // Strict checks — these must be inside the genome
   if (typeof payload.offset === 'number')
     assertOffsetInBounds(payload.offset, genomeLength, 'offset');
   if (typeof payload.startOffset === 'number')
@@ -1973,28 +1884,21 @@ function boundsCheckMiddleware(
   if (typeof payload.templateStart === 'number')
     assertOffsetInBounds(payload.templateStart, genomeLength, 'templateStart');
 
-  // Lax checks — must not be negative; upper-bound clamping is in the handler
   for (const field of ['start', 'end', 'endOffset', 'templateEnd'] as const) {
     const val = payload[field as keyof typeof payload];
     if (typeof val === 'number' && Number.isFinite(val) && val < 0) {
-      throw new RangeError(
-        `BOUNDS_VIOLATION: ${field}=${val} is negative`
-      );
+      throw new RangeError(`BOUNDS_VIOLATION: ${field}=${val} is negative`);
     }
   }
 }
 
-// ---------- Worker Message Handling (updated for async) ----------
+// ---------- Worker Message Handling ----------
 const engine = new ArkheEngine();
 
 self.onmessage = async (e: MessageEvent) => {
   const { type, id, payload } = e.data;
 
-  // ── SPRINT 1 FIX — TASK 4: Bounds-check middleware ───────────────────────
-  // Validate all offset coordinates against the current genome length before
-  // dispatching.  Throws RangeError (caught below) on any out-of-bounds access.
   boundsCheckMiddleware(type, payload, engine.slabManager.getGenomeLength());
-  // ─────────────────────────────────────────────────────────────────────────
 
   try {
     switch (type) {
@@ -2031,6 +1935,201 @@ self.onmessage = async (e: MessageEvent) => {
         postMessage({ type: 'STREAM_END_ACK', id });
         break;
       }
+
+      // ────────────────────────────────────────────────────────────────────────
+      // SS-01 — Scientific Streaming: CHUNK_RECEIVED
+      //
+      // Worker-side handler for the SlabStreamingPipeline protocol.
+      //
+      // PIPELINE:
+      //   1. Snapshot genomeLength BEFORE parsing — needed to determine the
+      //      exact byte range that this chunk adds to the slabs.
+      //
+      //   2. Delegate to handleStreamChunk() — the battle-tested FASTA parser
+      //      that handles: header stripping, base-code conversion, slab
+      //      allocation, OOM guard (HARD_MEMORY_LIMIT), and buffer management.
+      //      The transferred ArrayBuffer arrives as payload.buffer; we wrap it
+      //      in the expected { fileId, chunkBuffer, byteOffset } shape.
+      //
+      //   3. Per-chunk Sentinel scan — read [beforeLength, afterLength) back
+      //      from the slabs (already base-coded), convert to a string, and
+      //      call screenThreats(). Biosecurity scanning begins on the very
+      //      first megabyte while the genome tail is still downloading.
+      //      Capped at SS_SENTINEL_SCAN_MAX_BASES to stay inside a single
+      //      16 ms frame budget.
+      //
+      //   4. isFinal path — when the last chunk arrives, call finalizeStream()
+      //      to flush the FASTA line-accumulation buffer and the staging
+      //      base-code buffer into the slabs. Then post STREAM_END_ACK so the
+      //      main thread can proceed with RESTORE_HISTORY.
+      //
+      //   5. CHUNK_LOADED progress broadcast — main thread progress bars listen
+      //      for this message to update their UI.
+      //
+      //   6. CHUNK_ACK (backpressure release) — MUST be the LAST message sent.
+      //      Resolving the main thread's ACK promise after all work (including
+      //      the Sentinel scan) is complete ensures the backpressure reflects
+      //      the worker's true throughput, not just its message-queue depth.
+      //
+      // ERROR PATH:
+      //   If handleStreamChunk() returns void (stream aborted due to OOM or
+      //   malformed FASTA), we post CHUNK_ERR to propagate the failure to the
+      //   SlabStreamingPipeline's rejectChunk() handler on the main thread,
+      //   which throws inside streamFromUrl() for the caller to handle.
+      //   We still send CHUNK_ACK(ok=false) to release the in-flight semaphore
+      //   and prevent the pipeline from hanging indefinitely.
+      // ────────────────────────────────────────────────────────────────────────
+      case 'CHUNK_RECEIVED': {
+        const {
+          chunkId,
+          buffer,
+          isFinal,
+          totalBytes,
+        } = payload as {
+          chunkId: number;
+          buffer: ArrayBuffer;
+          isFinal: boolean;
+          totalBytes?: number;
+        };
+
+        // ── 1. Snapshot genome length before parsing ───────────────────────
+        const beforeLength = engine.slabManager.getGenomeLength();
+
+        // ── 2. Parse FASTA chunk → base codes → slabs ─────────────────────
+        //    Re-use the existing handleStreamChunk() pipeline so Scientific
+        //    Streaming inherits all guards (OOM, malformed FASTA, buffer
+        //    shrink) without duplicating logic.
+        if (buffer.byteLength > 0) {
+          const parseResult = engine.handleStreamChunk({
+            fileId: 'scientific-stream',
+            chunkBuffer: buffer,
+            byteOffset: beforeLength,
+          });
+
+          if (!parseResult) {
+            // handleStreamChunk() returned void → stream was aborted internally.
+            // The ERROR message was already posted by handleStreamChunk().
+            logToUI(
+              'WORKER',
+              `CHUNK_RECEIVED #${chunkId}: stream aborted during parse (OOM or malformed FASTA)`,
+              'error',
+            );
+            postMessage({
+              type: 'CHUNK_ERR',
+              id,
+              payload: { chunkId, reason: 'stream_parse_aborted' },
+            });
+            // Release backpressure even on error so the pipeline doesn't hang.
+            postMessage({ type: 'CHUNK_ACK', id, payload: { chunkId, ok: false } });
+            break;
+          }
+        }
+
+        const afterLength = engine.slabManager.getGenomeLength();
+        const newBases    = afterLength - beforeLength;
+
+        // ── 3. Per-chunk Sentinel biosecurity scan ────────────────────────
+        //    Convert newly committed base codes back to a character string
+        //    and scan for threat signatures. This runs BEFORE the ACK so
+        //    backpressure throttles the download to match the scan throughput.
+        if (newBases > 0 && engine.screeningEngine.isLoaded()) {
+          try {
+            // Cap scan range to SS_SENTINEL_SCAN_MAX_BASES (2 MB) to stay
+            // within a single animation frame budget (≈ 16 ms).
+            const scanStart = beforeLength;
+            const scanEnd   = Math.min(
+              afterLength - 1,
+              beforeLength + SS_SENTINEL_SCAN_MAX_BASES - 1,
+            );
+
+            const newRegion = engine.slabManager.readRegion(scanStart, scanEnd);
+
+            // Inline base-code → char conversion avoids allocating a full
+            // intermediate string array — Array.from().map() allocates O(n).
+            let seqStr = '';
+            for (let i = 0; i < newRegion.length; i++) {
+              seqStr += BASE_CODE_TO_CHAR[newRegion[i] as 0 | 1 | 2 | 3 | 4] ?? 'N';
+            }
+
+            const threats = engine.screenThreats(seqStr, scanStart, scanEnd);
+
+            if (threats.length > 0) {
+              logToUI(
+                'SENTINEL',
+                `Chunk #${chunkId}: ${threats.length} threat(s) at [${scanStart.toLocaleString()}–${scanEnd.toLocaleString()}]`,
+                'warning',
+              );
+              postMessage({
+                type: 'SENTINEL_THREAT_FOUND',
+                payload: {
+                  chunkId,
+                  threats,
+                  regionStart: scanStart,
+                  regionEnd:   scanEnd,
+                },
+              });
+            } else {
+              logToUI(
+                'SENTINEL',
+                `Chunk #${chunkId}: clean — ${newBases.toLocaleString()} bases scanned`,
+                'info',
+                /* debugOnly */ true,
+              );
+            }
+          } catch (scanErr) {
+            // A scan error must never block the pipeline — log and continue.
+            logToUI(
+              'SENTINEL',
+              `Chunk #${chunkId} scan error: ${(scanErr as Error).message}`,
+              'error',
+            );
+          }
+        }
+
+        // ── 4. Finalize stream on last chunk ──────────────────────────────
+        //    finalizeStream() flushes any incomplete FASTA line and the
+        //    staging base-code buffer into the slabs. Called only for the
+        //    final chunk to avoid double-flushing.
+        if (isFinal) {
+          engine.finalizeStream();
+          const finalLength = engine.slabManager.getGenomeLength();
+          logToUI(
+            'WORKER',
+            `Scientific stream complete — ${finalLength.toLocaleString()} bp committed to slabs`,
+            'success',
+          );
+          // Notify the main thread that streaming is fully done.
+          // The main thread can now send RESTORE_HISTORY to anchor the txId.
+          postMessage({
+            type: 'STREAM_END_ACK',
+            id,
+            payload: { totalBases: finalLength },
+          });
+        }
+
+        // ── 5. Progress broadcast ─────────────────────────────────────────
+        //    Sent before CHUNK_ACK so that the UI can update the progress bar
+        //    and loading overlay without waiting for the next chunk to start.
+        postMessage({
+          type: 'CHUNK_LOADED',
+          id,
+          payload: {
+            chunkId,
+            basesLoaded: afterLength,
+            totalBytes,      // undefined if server omitted Content-Length
+            isFinal,
+          },
+        });
+
+        // ── 6. Backpressure release (CHUNK_ACK) ───────────────────────────
+        //    This MUST be the final postMessage in the handler. Sending it
+        //    AFTER the Sentinel scan ensures the SlabStreamingPipeline's
+        //    in-flight semaphore reflects the worker's actual CPU capacity,
+        //    not just the time taken to deserialise the transfer.
+        postMessage({ type: 'CHUNK_ACK', id, payload: { chunkId, ok: true } });
+        break;
+      }
+
       case 'LOAD_SLICE': {
         const requestId = engine.getNextRequestId();
         const result = await engine.loadSlice(payload, requestId);
@@ -2048,7 +2147,6 @@ self.onmessage = async (e: MessageEvent) => {
           payload: { slabIndex: payload.slabIndex, offset: payload.offset, txId: payload.txId },
         });
         const result = await engine.performSurgicalMutation(payload, e.data.transferables || []);
-        // ── SPRINT 1 (FR-01): Record applied txId so VERIFY_SLAB_STATE can detect drift
         engine.slabManager.setCurrentTxId(result.txId);
         postMessage({ type: 'MUTATION_RESULT', id, payload: result });
 
@@ -2276,7 +2374,6 @@ self.onmessage = async (e: MessageEvent) => {
       }
       case 'RESTORE_HISTORY': {
         engine.chronos.restore(payload.commits, payload.branches, payload.headCommitId);
-        // ── SPRINT 1 (FR-01): Anchor the SlabManager's currentTxId to the restored head
         if (payload.headCommitId) {
           engine.slabManager.setCurrentTxId(payload.headCommitId);
         }
@@ -2292,27 +2389,8 @@ self.onmessage = async (e: MessageEvent) => {
         postMessage({ type: 'FOLD_PROTEIN_RESULT', id, payload: fold });
         break;
       }
-      // ──────────────────────────────────────────────────────────────────────────
-      // SPRINT 1 FIX — TASK 1: Phantom Case Handlers
-      //
-      // These three message types were dispatched by the UI but had no
-      // corresponding handler in the worker switch — every invocation silently
-      // fell through to the `default:` warn and was discarded.
-      // ──────────────────────────────────────────────────────────────────────────
 
-      // ── VERIFY_SLAB_STATE ─────────────────────────────────────────────────
-      //
-      // Reconciliation entry point for the Frozen Recovery fix (FR-01, documented
-      // in SlabManager.ts).  The main thread sends this message after a cloud sync
-      // to confirm that the worker's physical slab bytes reflect the expected commit.
-      //
-      // Payload : { expectedTxId: string }
-      // Response: { status: 'ok' | 'hard_reset_required', slabVersion: number }
-      //
-      //   'ok'                  — txId matches; slabs are consistent.
-      //   'hard_reset_required' — txId mismatch detected; SlabManager.hardReset()
-      //                           was called; the main thread must trigger a full
-      //                           genome re-load (RESET_ENGINE → STREAM → RESTORE_HISTORY).
+      // ── VERIFY_SLAB_STATE (FR-01) ─────────────────────────────────────────
       case 'VERIFY_SLAB_STATE': {
         const { expectedTxId } = payload as { expectedTxId: string };
         const status = engine.slabManager.revertToSnapshot(expectedTxId);
@@ -2336,33 +2414,12 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       // ── RUN_FULL_AUDIT ────────────────────────────────────────────────────
-      //
-      // Triggers a comprehensive, synchronous audit of the currently loaded
-      // genome.  Forces fresh Sentinel, ORF and Synteny scans and returns a
-      // consolidated report in a single response message.
-      //
-      // Payload : {} (empty — no parameters required)
-      // Response: {
-      //   genomeLength  : number,
-      //   slabVersion   : number,
-      //   currentTxId   : string | null,
-      //   sentinel      : SentinelSummary | null,
-      //   orf           : ORFScanResult  | null,
-      //   syntenyAnchors: SyntenyAnchor[],
-      //   timestamp     : number,
-      // }
       case 'RUN_FULL_AUDIT': {
         const genomeLength = engine.slabManager.getGenomeLength();
         logToUI('SYSTEM', `Full audit started — genome ${genomeLength} bp`, 'info');
 
-        // Force fresh Sentinel scan (synchronous for the summary)
         const sentinelSummary = engine.refreshSentinelScan();
-
-        // Force fresh ORF scan (kicks off incremental background scan and
-        // returns whatever the first batch produces)
         const orfResult = engine.refreshORFScan();
-
-        // Force fresh Synteny scan (starts incremental background scan)
         engine.refreshSyntenyScan();
         const syntenyAnchors = engine.getSyntenyAnchors();
 
@@ -2388,21 +2445,6 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       // ── RUN_ISOFORM_SCAN ──────────────────────────────────────────────────
-      //
-      // Performs a combined splice-site prediction + isoform enumeration scan
-      // over a genomic region, interfacing with SlabManager to read the raw
-      // bytes and with BioLogic to compute all isoform products.
-      //
-      // Payload : { start: number; end: number; strand?: '+' | '-' }
-      // Response: {
-      //   start        : number,
-      //   end          : number,
-      //   strand       : '+' | '-',
-      //   spliceSites  : SpliceSite[],
-      //   isoformGroups: Array<{ orf: ORF; isoforms: SpliceIsoform[] }>,
-      //   totalIsoforms: number,
-      //   timestamp    : number,
-      // }
       case 'RUN_ISOFORM_SCAN': {
         const scanStart: number = payload.start ?? 0;
         const scanEnd: number   = Math.min(
@@ -2424,21 +2466,14 @@ self.onmessage = async (e: MessageEvent) => {
           break;
         }
 
-        // Read the region bytes from the SlabManager
         const scanRegion = engine.slabManager.readRegion(scanStart, scanEnd);
-
-        // Predict splice sites within this buffer
         const spliceSites = await engine.predictSpliceSites(scanRegion, scanStrand);
-
-        // Find all ORFs that overlap the requested range (from cache or fresh scan)
         const overlappingORFs = engine.getORFsInRange(scanStart, scanEnd);
 
-        // Generate isoforms for each ORF that has qualifying splice sites
         const isoformGroups: Array<{ orf: typeof overlappingORFs[0]; isoforms: Awaited<ReturnType<typeof engine.predictIsoforms>> }> = [];
         let totalIsoforms = 0;
 
         for (const orf of overlappingORFs) {
-          // Translate orf coordinates to region-local for isoform prediction
           const localORF = {
             ...orf,
             start: Math.max(0, orf.start - scanStart),

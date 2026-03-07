@@ -40,6 +40,7 @@ export default function SentinelPanel() {
 
   return (
     <motion.div 
+      data-tour="sentinel"
       className={cn(
         "h-full flex flex-col bg-void overflow-hidden relative",
         "border border-razor rounded-lg backdrop-blur-md",

@@ -1088,6 +1088,210 @@ function stringToBaseBuffer(seq: string): Uint8Array {
   return buf;
 }
 
+// ============================================================================
+// 🧬 FASTA SLAB PARSER — Chunk-safe, Slab-Aware, TextEncoder-Free
+// ============================================================================
+
+/**
+ * IUPAC + RNA ambiguity codes → BaseCode (0–4).
+ *
+ * CRITICAL: TextEncoder is intentionally NOT used anywhere in this map or the
+ * class below.  TextEncoder.encode() returns UTF-8 byte values (A=65, T=84 …)
+ * which are INCOMPATIBLE with BaseCode encoding (A=0, G=1, C=2, T=3, N=4).
+ * Using TextEncoder here would silently corrupt every ORF, translation, and
+ * thermodynamic calculation downstream.  See BIO-03 in the patch log above.
+ */
+const FASTA_BASE_MAP: Readonly<Record<string, number>> = {
+  A: 0, G: 1, C: 2, T: 3,
+  U: 3, // RNA uracil → T (BaseCode 3)
+  N: 4,
+  // IUPAC ambiguity codes → N (4) for slab storage
+  R: 4, Y: 4, S: 4, W: 4, K: 4,
+  M: 4, B: 4, D: 4, H: 4, V: 4,
+};
+
+/**
+ * FastaSlabParser
+ *
+ * A streaming, slab-aware FASTA parser designed for large sequences delivered
+ * in multiple chunks (e.g. from ReadableStream, chunked fetch, or IPC).
+ *
+ * KEY DESIGN DECISIONS
+ * ────────────────────
+ *
+ * 1. PARTIAL CHUNK SAFETY
+ *    Maintains an internal `_lineBuffer` that accumulates bytes across
+ *    feedChunk() calls.  Only lines terminated by '\n' are processed.
+ *    Any trailing partial line stays buffered until the next chunk arrives,
+ *    making the parser safe with arbitrarily-sized chunks (including 1 byte).
+ *
+ * 2. TextEncoder IS NOT USED — BIO-03 COMPLIANT
+ *    All string-to-buffer conversions use FASTA_BASE_MAP, which maps directly
+ *    to BaseCodes (A=0, G=1, C=2, T=3, N=4).  This is the same encoding used
+ *    by stringToBaseBuffer() and throughout BioLogic.ts.
+ *
+ * 3. HEADER DETECTION
+ *    Lines beginning with '>' are FASTA description lines and are discarded.
+ *    GenBank structural markers (LOCUS, ORIGIN, //) are also handled for
+ *    forward compatibility with mixed-format inputs.
+ *
+ * 4. OUTPUT FORMAT
+ *    feedChunk() and flush() return a Uint8Array of BaseCodes ready for
+ *    SlabManager.appendBytes().  An empty Uint8Array is returned for
+ *    header-only or whitespace-only chunks — safe to pass to appendBytes()
+ *    because it short-circuits on length === 0.
+ *
+ * USAGE (worker context)
+ * ──────────────────────
+ *   const parser = new FastaSlabParser();
+ *
+ *   // On each STREAM_CHUNK message:
+ *   const baseCodes = parser.feedChunk(chunkText);
+ *   if (baseCodes.length > 0) slabManager.appendBytes(baseCodes);
+ *
+ *   // On STREAM_END:
+ *   const remaining = parser.flush();
+ *   if (remaining.length > 0) slabManager.appendBytes(remaining);
+ *   parser.reset();  // ready for the next sequence
+ *
+ * COMPARISON WITH StreamParser (src/lib/StreamParser.ts)
+ * ────────────────────────────────────────────────────────
+ *   StreamParser uses a per-base onBase() callback, accumulating BaseCodes
+ *   into a staging Array<BaseCode> before appendBytes().  FastaSlabParser
+ *   emits Uint8Array chunks directly, eliminating the staging array and
+ *   reducing GC pressure for large chunks (> 1 MB).
+ */
+export class FastaSlabParser {
+  // ── Internal state ────────────────────────────────────────────────────────
+
+  /** Accumulates bytes that have not yet been terminated by '\n'. */
+  private _lineBuffer = '';
+
+  /**
+   * Whether the parser is currently inside a FASTA header line.
+   * Set true when a '>' line is encountered; reset false after the header
+   * line is fully consumed (a FASTA header is always exactly one line).
+   * Only relevant when a header line spans a chunk boundary without a '\n'.
+   */
+  private _inHeader = false;
+
+  /**
+   * Running total of BaseCode bytes emitted across all feedChunk() + flush()
+   * calls since the last reset().  Useful for progress tracking.
+   */
+  private _totalBasesEmitted = 0;
+
+  // ── Public API ────────────────────────────────────────────────────────────
+
+  /**
+   * feedChunk
+   *
+   * Accept a raw text chunk from the FASTA stream and return a Uint8Array of
+   * BaseCodes ready for SlabManager.appendBytes().
+   *
+   * @param chunk  Raw text chunk (JS string).  May contain '\r\n' or '\n'
+   *               line endings; '\r' is stripped before processing.
+   * @returns      Uint8Array of BaseCode values (0–4).  May be empty if the
+   *               chunk contains only headers, whitespace, or a partial line.
+   */
+  feedChunk(chunk: string): Uint8Array {
+    this._lineBuffer += chunk.replace(/\r/g, '');
+    const lines = this._lineBuffer.split('\n');
+    // Last element is a partial line (no trailing '\n' yet) — keep buffered.
+    this._lineBuffer = lines.pop() ?? '';
+    return this._processLines(lines);
+  }
+
+  /**
+   * flush
+   *
+   * Process any remaining content in the internal line buffer.
+   * MUST be called after the final chunk — the last line of a FASTA file
+   * often lacks a trailing newline and would otherwise be silently dropped.
+   *
+   * @returns  Uint8Array of BaseCodes for the final partial line, or an
+   *           empty Uint8Array if the stream ended with a newline.
+   */
+  flush(): Uint8Array {
+    if (this._lineBuffer.length === 0) return new Uint8Array(0);
+    const result = this._processLines([this._lineBuffer]);
+    this._lineBuffer = '';
+    return result;
+  }
+
+  /**
+   * reset
+   *
+   * Return the parser to its initial state.  Call between sequences when
+   * reusing a single instance for multiple FASTA records.
+   */
+  reset(): void {
+    this._lineBuffer        = '';
+    this._inHeader          = false;
+    this._totalBasesEmitted = 0;
+  }
+
+  /** Running total of BaseCode bytes emitted since the last reset(). */
+  get totalBasesEmitted(): number {
+    return this._totalBasesEmitted;
+  }
+
+  // ── Private helpers ───────────────────────────────────────────────────────
+
+  /**
+   * _processLines
+   *
+   * Convert an array of complete FASTA lines into a Uint8Array of BaseCodes.
+   *
+   * Header lines ('>'), GenBank structural markers (LOCUS, ORIGIN, //) and
+   * blank lines are skipped.  Sequence lines are converted base-by-base using
+   * FASTA_BASE_MAP — NOT TextEncoder.  Digits and whitespace within sequence
+   * lines (common in GenBank flat-file format) are stripped.
+   *
+   * Unknown characters (not in FASTA_BASE_MAP) emit N (4) as a safe fallback
+   * so the slab length stays consistent with the source sequence length.
+   */
+  private _processLines(lines: string[]): Uint8Array {
+    // Pre-allocate worst-case buffer; trim to actual length before returning.
+    const scratch = new Uint8Array(
+      lines.reduce((sum, l) => sum + l.length, 0),
+    );
+    let writePos = 0;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+
+      // ── Header / structural marker detection ─────────────────────────────
+      if (
+        trimmed.startsWith('>') ||
+        trimmed.startsWith('LOCUS') ||
+        trimmed.startsWith('ORIGIN') ||
+        trimmed === '//'
+      ) {
+        // FASTA headers are always one line; set and immediately clear the flag.
+        this._inHeader = trimmed.startsWith('>');
+        if (this._inHeader) this._inHeader = false;
+        continue;
+      }
+
+      // ── Sequence data line ───────────────────────────────────────────────
+      // Strip whitespace and GenBank line-number digits before mapping.
+      const seqLine = trimmed.replace(/[\s0-9]/g, '').toUpperCase();
+
+      for (let i = 0; i < seqLine.length; i++) {
+        const code = FASTA_BASE_MAP[seqLine[i]];
+        // Emit N (4) for any unrecognised character — preserves sequence length.
+        scratch[writePos++] = code !== undefined ? code : 4;
+      }
+    }
+
+    this._totalBasesEmitted += writePos;
+    return scratch.subarray(0, writePos); // zero-copy view
+  }
+}
+
+
 // ---------- Isoform Predictor ----------
 export function predictIsoforms(
   buffer: Uint8Array,
@@ -1323,4 +1527,5 @@ export default {
   COMPLEMENT,
   calculateMolecularWeight,
   predictSecondaryStructure,
+  FastaSlabParser,
 };
